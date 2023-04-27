@@ -9,12 +9,16 @@ layout (set = 0, binding = 0) uniform UBOScene
 {
 	mat4 projection;
 	mat4 view;
-	vec4 lightPos;
+	vec4 lightDir;
 	vec4 viewPos;
+	mat4 lightMatrix;
 } uboScene;
 
 layout(push_constant) uniform PushConsts {
 	mat4 model;
+	vec4 baseColorFactor;
+	float roughnessFactor;
+	float metallicFactor;
 } primitive;
 
 layout (location = 0) out vec3 outNormal;
@@ -22,6 +26,8 @@ layout (location = 1) out vec3 outColor;
 layout (location = 2) out vec2 outUV;
 layout (location = 3) out vec3 outViewVec;
 layout (location = 4) out vec3 outLightVec;
+layout (location = 5) out vec3 outWorldPos;
+layout (location = 6) out vec4 outLightSpacePos;
 
 void main() 
 {
@@ -30,9 +36,10 @@ void main()
 	outUV = inUV;
 	gl_Position = uboScene.projection * uboScene.view * primitive.model * vec4(inPos.xyz, 1.0);
 	
-	vec4 pos = uboScene.view * vec4(inPos, 1.0);
-	outNormal = mat3(uboScene.view) * inNormal;
-	vec3 lPos = mat3(uboScene.view) * uboScene.lightPos.xyz;
-	outLightVec = uboScene.lightPos.xyz - pos.xyz;
-	outViewVec = uboScene.viewPos.xyz - pos.xyz;	
+	vec4 pos = primitive.model * vec4(inPos, 1.0);
+	outNormal = transpose(inverse(mat3(primitive.model))) * inNormal;
+	outLightVec = uboScene.lightDir.xyz;
+	outViewVec = uboScene.viewPos.xyz - pos.xyz;
+	outWorldPos = pos.xyz;
+	outLightSpacePos = uboScene.lightMatrix * pos;
 }
