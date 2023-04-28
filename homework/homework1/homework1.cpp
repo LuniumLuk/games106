@@ -17,9 +17,17 @@
  * If you are looking for a complete glTF implementation, check out https://github.com/SaschaWillems/Vulkan-glTF-PBR/
  */
 
-// [TODO] Animation System
-// [TODO] Handle Window Resize
-// [TODO] Simplify Code
+// [TODO] Add Skeleton Animation Support
+
+/*
+ * The RenderPasses are as follow:
+ * 
+ * Pass #1: Shadow Pass: (Render variance shadow map)
+ * Pass #2: Filter Pass: (Filter variance shadow map)
+ * Pass #3: Main Pass: (Render model with lighting and shadow)
+ * Pass #4: Postprocessing Pass: (Postprocessing and present)
+ * 
+ */
 
 #define TINYGLTF_IMPLEMENTATION
 #define STB_IMAGE_IMPLEMENTATION
@@ -32,6 +40,10 @@
 #include "vulkanexamplebase.h"
 
 #define ENABLE_VALIDATION true
+
+#include "utility.h"
+#include <glm/gtx/compatibility.hpp>
+#include <glm/gtx/matrix_decompose.hpp>
 
 // Index for unloaded texture, such texture will be replaced with a default (white | black) texture
 #define TEXTURE_INDEX_EMPTY 0xffffffff
@@ -46,6 +58,8 @@
 // First we render the whole scene to a separate framebuffer with a color attachment and a depth attachment
 // Then in the postprocessing stage, we use the color attachment as input and render it to the screen
 #define RENDER_TARGET_COLOR_FORMAT VK_FORMAT_R32G32B32A32_SFLOAT
+
+#define MAX_NUM_JOINTS 32
 
 // Contains everything required to render a glTF model in Vulkan
 // This class is heavily simplified (compared to glTF's feature set) but retains the basic glTF structure
@@ -62,6 +76,8 @@ public:
 		glm::vec3 normal;
 		glm::vec2 uv;
 		glm::vec3 color;
+		glm::vec4 joint;
+		glm::vec4 weight;
 	};
 
 	// Single vertex buffer for all primitives
@@ -91,6 +107,28 @@ public:
 	// Contains the node's (optional) geometry and can be made up of an arbitrary number of primitives
 	struct Mesh {
 		std::vector<Primitive> primitives;
+		struct ShaderData {
+			vks::Buffer buffer;
+			struct Values {
+				glm::mat4 matrix;
+				glm::mat4 matrixInverseTransposed;
+				glm::mat4 jointMatrices[MAX_NUM_JOINTS];
+				int jointCount;
+			} values;
+		} shaderData;
+		VkDescriptorSet descriptorSet;
+
+		~Mesh() {
+			shaderData.buffer.destroy();
+		}
+	};
+
+	struct Node;
+
+	struct Skin {
+		Node* root = nullptr;
+		std::vector<glm::mat4> inverseBindMatrices;
+		std::vector<Node*> joints;
 	};
 
 	// A node represents an object in the glTF scene graph
@@ -104,8 +142,69 @@ public:
 				delete child;
 			}
 		}
+
+		glm::mat4 worldTransform() const {
+			glm::mat4 mat = matrix;
+			VulkanglTFModel::Node* p = parent;
+			while (p) {
+				mat = p->matrix * mat;
+				p = p->parent;
+			}
+			return mat;
+		}
+
+		Skin* skin = nullptr;
+		int32_t skinIndex = -1;
+
+		void update() {
+			glm::mat4 m = worldTransform();
+			mesh.shaderData.values.matrix = m;
+			mesh.shaderData.values.matrixInverseTransposed = glm::transpose(glm::inverse(m));
+			if (skin) {
+				glm::mat4 inverseTransform = glm::inverse(m);
+				size_t jointCount = std::min(skin->joints.size(), static_cast<size_t>(MAX_NUM_JOINTS));
+				for (size_t i = 0; i < jointCount; ++i) {
+					Node* jointNode = skin->joints[i];
+					glm::mat4 jointTransform = jointNode->worldTransform() * skin->inverseBindMatrices[i];
+					jointTransform = inverseTransform * jointTransform;
+					mesh.shaderData.values.jointMatrices[i] = jointTransform;
+				}
+				mesh.shaderData.values.jointCount = static_cast<int>(jointCount);
+			}
+			else {
+				mesh.shaderData.values.jointCount = 0;
+			}
+			memcpy(mesh.shaderData.buffer.mapped, &mesh.shaderData.values, sizeof(mesh.shaderData.values));
+
+			for (auto& child : children) {
+				child->update();
+			}
+		}
 	};
 
+	struct AnimationChannel {
+		enum struct PathType { Translation, Rotation, Scale };
+		PathType path;
+		Node* node;
+		uint32_t samplerIndex;
+	};
+
+	struct AnimationSampler {
+		enum struct InterpolationType { Linear, Step, CubicSpline };
+		InterpolationType interpolation;
+		std::vector<float> inputs;
+		std::vector<glm::vec4> outputs;
+	};
+
+	struct Animation {
+		std::string name;
+		std::vector<AnimationSampler> samplers;
+		std::vector<AnimationChannel> channels;
+		float start = std::numeric_limits<float>::max();
+		float end = std::numeric_limits<float>::min();
+	};
+
+	// [TODO] Actually, we need not to use pushconstant so far
 	struct PushConstant {
 		glm::mat4 model;
 		glm::vec4 baseColorFactor;
@@ -115,16 +214,25 @@ public:
 
 	// A glTF material stores information in e.g. the texture that is attached to it and colors
 	struct Material {
-		glm::vec4 baseColorFactor = glm::vec4(1.0f);
-		float roughnessFactor = 1.0f;
-		float metallicFactor = 1.0f;
 		uint32_t baseColorTextureIndex = TEXTURE_INDEX_EMPTY;
 		uint32_t normalTextureIndex = TEXTURE_INDEX_EMPTY;
 		uint32_t metallicRoughnessTextureIndex = TEXTURE_INDEX_EMPTY;
 		uint32_t emissiveTextureIndex = TEXTURE_INDEX_EMPTY;
 		uint32_t occlusionTextureIndex = TEXTURE_INDEX_EMPTY;
-		// We use one set for textures of each material
+		// We use one descriptor set for textures and parameters of each material
+		struct ShaderData {
+			vks::Buffer buffer;
+			struct Values {
+				glm::vec4 baseColorFactor = glm::vec4(1.0f);
+				float roughnessFactor = 1.0f;
+				float metallicFactor = 1.0f;
+			} values;
+		} shaderData;
 		VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+
+		~Material() {
+			shaderData.buffer.destroy();
+		}
 	};
 
 	// Contains the texture for a single glTF image
@@ -148,6 +256,9 @@ public:
 	std::vector<Texture> textures;
 	std::vector<Material> materials;
 	std::vector<Node*> nodes;
+	std::vector<Node*> linearNodes; // Store all nodes linearly, in the same order as glTF
+	std::vector<Animation> animations;
+	std::vector<Skin> skins;
 
 	~VulkanglTFModel()
 	{
@@ -237,7 +348,7 @@ public:
 			tinygltf::Material glTFMaterial = input.materials[i];
 			// Get the base color factor
 			if (glTFMaterial.values.find("baseColorFactor") != glTFMaterial.values.end()) {
-				materials[i].baseColorFactor = glm::make_vec4(glTFMaterial.values["baseColorFactor"].ColorFactor().data());
+				materials[i].shaderData.values.baseColorFactor = glm::make_vec4(glTFMaterial.values["baseColorFactor"].ColorFactor().data());
 			}
 			// Get base color texture index
 			if (glTFMaterial.values.find("baseColorTexture") != glTFMaterial.values.end()) {
@@ -250,11 +361,11 @@ public:
 			}
 			// Get the roughness factor
 			if (glTFMaterial.values.find("roughnessFactor") != glTFMaterial.values.end()) {
-				materials[i].roughnessFactor = static_cast<float>(glTFMaterial.values["roughnessFactor"].Factor());
+				materials[i].shaderData.values.roughnessFactor = static_cast<float>(glTFMaterial.values["roughnessFactor"].Factor());
 			}
 			// Get the metallic factor
 			if (glTFMaterial.values.find("metallicFactor") != glTFMaterial.values.end()) {
-				materials[i].metallicFactor = static_cast<float>(glTFMaterial.values["metallicFactor"].Factor());
+				materials[i].shaderData.values.metallicFactor = static_cast<float>(glTFMaterial.values["metallicFactor"].Factor());
 			}
 			// Get normal texture index
 			if (glTFMaterial.additionalValues.find("normalTexture") != glTFMaterial.additionalValues.end()) {
@@ -268,14 +379,150 @@ public:
 			if (glTFMaterial.additionalValues.find("occlusionTexture") != glTFMaterial.additionalValues.end()) {
 				materials[i].occlusionTextureIndex = glTFMaterial.additionalValues["occlusionTexture"].TextureIndex();
 			}
+
+			VK_CHECK_RESULT(vulkanDevice->createBuffer(
+				VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				&materials[i].shaderData.buffer,
+				sizeof(materials[i].shaderData.values)));
+
+			VK_CHECK_RESULT(materials[i].shaderData.buffer.map());
+
+			memcpy(materials[i].shaderData.buffer.mapped, &materials[i].shaderData.values, sizeof(materials[i].shaderData.values));
 		}
 	}
 
-	void loadNode(const tinygltf::Node& inputNode, const tinygltf::Model& input, VulkanglTFModel::Node* parent, std::vector<uint32_t>& indexBuffer, std::vector<VulkanglTFModel::Vertex>& vertexBuffer)
+	void loadSkins(const tinygltf::Model& input) {
+		for (auto const& s : input.skins) {
+			Skin skin{};
+
+			if (s.skeleton > -1) {
+				skin.root = linearNodes[s.skeleton];
+			}
+
+			for (auto jointIndex : s.joints) {
+				if (jointIndex >= 0) {
+					skin.joints.push_back(linearNodes[jointIndex]);
+				}
+			}
+
+			if (s.inverseBindMatrices > -1) {
+				auto const& accessor = input.accessors[s.inverseBindMatrices];
+				auto const& bufferView = input.bufferViews[accessor.bufferView];
+				auto const& buffer = input.buffers[bufferView.buffer];
+				skin.inverseBindMatrices.resize(accessor.count);
+				memcpy(skin.inverseBindMatrices.data(), &buffer.data[accessor.byteOffset + bufferView.byteOffset], accessor.count * sizeof(glm::mat4));
+			}
+
+			skins.push_back(skin);
+		}
+	}
+
+	void loadAnimations(const tinygltf::Model& input) {
+		for (auto const& anim : input.animations) {
+			Animation animation{};
+			animation.name = anim.name;
+			if (animation.name.empty()) {
+				animation.name = (std::string("Animation_") + std::to_string(animations.size()));
+			}
+
+			for (auto const& samp : anim.samplers) {
+				AnimationSampler sampler{};
+
+				if (samp.interpolation == "LINEAR") sampler.interpolation = AnimationSampler::InterpolationType::Linear;
+				if (samp.interpolation == "STEP") sampler.interpolation = AnimationSampler::InterpolationType::Step;
+				if (samp.interpolation == "CUBICSPLINE") sampler.interpolation = AnimationSampler::InterpolationType::CubicSpline;
+
+				{
+					auto const& accessor = input.accessors[samp.input];
+					auto const& bufferView = input.bufferViews[accessor.bufferView];
+					auto const& buffer = input.buffers[bufferView.buffer];
+
+					assert(accessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT && "Animation input component type must be float");
+
+					const void* ptr = &buffer.data[accessor.byteOffset + bufferView.byteOffset];
+					auto buf = static_cast<const float*>(ptr);
+
+					for (size_t i = 0; i < accessor.count; ++i) {
+						sampler.inputs.push_back(buf[i]);
+					}
+
+					for (auto const& input : sampler.inputs) {
+						if (input < animation.start) animation.start = input;
+						if (input > animation.end) animation.end = input;
+					}
+				}
+
+				{
+					auto const& accessor = input.accessors[samp.output];
+					auto const& bufferView = input.bufferViews[accessor.bufferView];
+					auto const& buffer = input.buffers[bufferView.buffer];
+
+					assert(accessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT && "Animation output component type must be float");
+
+					const void* ptr = &buffer.data[accessor.byteOffset + bufferView.byteOffset];
+					switch (accessor.type) {
+					case TINYGLTF_TYPE_VEC3: {
+						auto buf = static_cast<const glm::vec3*>(ptr);
+						for (size_t i = 0; i < accessor.count; ++i) {
+							sampler.outputs.push_back(glm::vec4(buf[i], 0.0f));
+						}
+						break;
+					}
+					case TINYGLTF_TYPE_VEC4: {
+						auto buf = static_cast<const glm::vec4*>(ptr);
+						for (size_t i = 0; i < accessor.count; ++i) {
+							sampler.outputs.push_back(buf[i]);
+						}
+						break;
+					}
+					default:
+						std::cerr << "Unknown type for animation output" << std::endl;
+						break;
+					}
+				}
+
+				animation.samplers.push_back(sampler);
+			}
+
+			for (auto const& chan : anim.channels) {
+				AnimationChannel channel{};
+
+				if (chan.target_path == "rotation") channel.path = AnimationChannel::PathType::Rotation;
+				if (chan.target_path == "translation") channel.path = AnimationChannel::PathType::Translation;
+				if (chan.target_path == "scale") channel.path = AnimationChannel::PathType::Scale;
+				if (chan.target_path == "weights") {
+					std::clog << "weights not supported for current AnimationChannel\n";
+					continue;
+				}
+
+				channel.samplerIndex = chan.sampler;
+				channel.node = linearNodes[chan.target_node];
+				if (!channel.node) {
+					continue;
+				}
+
+				animation.channels.push_back(channel);
+			}
+
+			animations.push_back(animation);
+		}
+	}
+
+	void loadNode(const tinygltf::Node& inputNode, uint32_t index, const tinygltf::Model& input, VulkanglTFModel::Node* parent, std::vector<uint32_t>& indexBuffer, std::vector<VulkanglTFModel::Vertex>& vertexBuffer)
 	{
 		VulkanglTFModel::Node* node = new VulkanglTFModel::Node{};
 		node->matrix = glm::mat4(1.0f);
 		node->parent = parent;
+
+		// Setup uniform buffer for animation
+		VK_CHECK_RESULT(vulkanDevice->createBuffer(
+			VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			&node->mesh.shaderData.buffer,
+			sizeof(node->mesh.shaderData.values)));
+
+		VK_CHECK_RESULT(node->mesh.shaderData.buffer.map());
 
 		// Get the local node matrix
 		// It's either made up from translation, rotation, scale or a 4x4 matrix
@@ -294,9 +541,10 @@ public:
 		};
 
 		// Load node's children
+		linearNodes.resize(input.nodes.size());
 		if (inputNode.children.size() > 0) {
 			for (size_t i = 0; i < inputNode.children.size(); i++) {
-				loadNode(input.nodes[inputNode.children[i]], input , node, indexBuffer, vertexBuffer);
+				loadNode(input.nodes[inputNode.children[i]], inputNode.children[i], input, node, indexBuffer, vertexBuffer);
 			}
 		}
 
@@ -315,7 +563,11 @@ public:
 					const float* positionBuffer = nullptr;
 					const float* normalsBuffer = nullptr;
 					const float* texCoordsBuffer = nullptr;
+					const void* jointsBuffer = nullptr;
+					const float* weightsBuffer = nullptr;
 					size_t vertexCount = 0;
+
+					int jointsComponentType;
 
 					// Get buffer data for vertex positions
 					if (glTFPrimitive.attributes.find("POSITION") != glTFPrimitive.attributes.end()) {
@@ -338,6 +590,22 @@ public:
 						texCoordsBuffer = reinterpret_cast<const float*>(&(input.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
 					}
 
+					// Get buffer data for vertex joint indices
+					if (glTFPrimitive.attributes.find("JOINTS_0") != glTFPrimitive.attributes.end()) {
+						const tinygltf::Accessor& accessor = input.accessors[glTFPrimitive.attributes.find("JOINTS_0")->second];
+						const tinygltf::BufferView& view = input.bufferViews[accessor.bufferView];
+						jointsBuffer = reinterpret_cast<const float*>(&(input.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
+						jointsComponentType = accessor.componentType;
+					}
+					// Get buffer data for vertex joint weights
+					if (glTFPrimitive.attributes.find("WEIGHTS_0") != glTFPrimitive.attributes.end()) {
+						const tinygltf::Accessor& accessor = input.accessors[glTFPrimitive.attributes.find("WEIGHTS_0")->second];
+						const tinygltf::BufferView& view = input.bufferViews[accessor.bufferView];
+						weightsBuffer = reinterpret_cast<const float*>(&(input.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
+					}
+
+					bool hasSkin = jointsBuffer && weightsBuffer;
+
 					// Append data to model's vertex buffer
 					for (size_t v = 0; v < vertexCount; v++) {
 						Vertex vert{};
@@ -345,6 +613,30 @@ public:
 						vert.normal = glm::normalize(glm::vec3(normalsBuffer ? glm::make_vec3(&normalsBuffer[v * 3]) : glm::vec3(0.0f)));
 						vert.uv = texCoordsBuffer ? glm::make_vec2(&texCoordsBuffer[v * 2]) : glm::vec3(0.0f);
 						vert.color = glm::vec3(1.0f);
+
+						if (hasSkin) {
+							switch (jointsComponentType) {
+							case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+								const uint16_t* buf = static_cast<const uint16_t*>(jointsBuffer);
+								vert.joint = glm::vec4(glm::make_vec4(&buf[v * 4]));
+								break;
+							}
+							case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE: {
+								const uint8_t* buf = static_cast<const uint8_t*>(jointsBuffer);
+								vert.joint = glm::vec4(glm::make_vec4(&buf[v * 4]));
+								break;
+							}
+							default:
+								std::cerr << "Joint component type " << jointsComponentType << " not supported!" << std::endl;
+								break;
+							}
+							vert.weight = glm::make_vec4(&weightsBuffer[v * 4]);
+						}
+						else {
+							vert.joint = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+							vert.weight = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+						}
+
 						vertexBuffer.push_back(vert);
 					}
 				}
@@ -398,11 +690,67 @@ public:
 		else {
 			nodes.push_back(node);
 		}
+
+		linearNodes[index] = node;
 	}
 
 	/*
 		glTF rendering functions
 	*/
+
+	void update(uint32_t animationIndex, float time) {
+		if (animationIndex >= static_cast<uint32_t>(animations.size())) {
+			std::cerr << "No animation with index " << animationIndex << std::endl;
+			return;
+		}
+
+		auto const& animation = animations[animationIndex];
+
+		for (auto const& channel : animation.channels) {
+			auto const& sampler = animation.samplers[channel.samplerIndex];
+			if (sampler.inputs.size() > sampler.outputs.size()) {
+				continue;
+			}
+
+			for (size_t i = 0; i < sampler.inputs.size() - 1; ++i) {
+				if (time < sampler.inputs[i] || time > sampler.inputs[i + 1]) continue;
+				float u = std::max(0.0f, time - sampler.inputs[i]) / (sampler.inputs[i + 1] - sampler.inputs[i]);
+				if (u <= 1.0f) {
+					glm::vec3 scale;
+					glm::quat rotation;
+					glm::vec3 translation;
+					glm::vec3 skew;
+					glm::vec4 perspective;
+					glm::decompose(channel.node->matrix, scale, rotation, translation, skew, perspective);
+
+					switch (channel.path) {
+					case AnimationChannel::PathType::Translation: {
+						auto t = glm::lerp(sampler.outputs[i], sampler.outputs[i + 1], u);
+						translation = glm::vec3(t);
+						break;
+					}
+					case AnimationChannel::PathType::Scale: {
+						auto s = glm::lerp(sampler.outputs[i], sampler.outputs[i + 1], u);
+						scale = glm::vec3(s);
+						break;
+					}
+					case AnimationChannel::PathType::Rotation: {
+						glm::quat q0 = glm::make_quat(&sampler.outputs[i].x);
+						glm::quat q1 = glm::make_quat(&sampler.outputs[i + 1].x);
+						rotation = glm::normalize(glm::slerp(q0, q1, u));
+						break;
+					}
+					}
+
+					channel.node->matrix = glm::translate(glm::mat4(1.0f), translation) * glm::mat4(rotation) * glm::scale(glm::mat4(1.0f), scale);
+				}
+			}
+		}
+
+		for (auto& node : nodes) {
+			node->update();
+		}
+	}
 
 	// Draw a single node including child nodes (if present)
 	void drawNode(VkCommandBuffer commandBuffer, VkPipelineLayout pipelineLayout, VulkanglTFModel::Node* node)
@@ -410,21 +758,17 @@ public:
 		if (node->mesh.primitives.size() > 0) {
 			// Pass the node's matrix via push constants
 			// Traverse the node hierarchy to the top-most parent to get the final matrix of the current node
-			glm::mat4 nodeMatrix = node->matrix;
-			VulkanglTFModel::Node* currentParent = node->parent;
-			while (currentParent) {
-				nodeMatrix = currentParent->matrix * nodeMatrix;
-				currentParent = currentParent->parent;
-			}
+			glm::mat4 nodeMatrix = node->worldTransform();
+			vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 3, 1, &node->mesh.descriptorSet, 0, nullptr);
 
 			for (VulkanglTFModel::Primitive& primitive : node->mesh.primitives) {
 				if (primitive.indexCount > 0) {
 					PushConstant push{};
 					push.model = nodeMatrix;
 					// Pass material properties via push constants
-					push.baseColorFactor = materials[primitive.materialIndex].baseColorFactor;
-					push.roughnessFactor = materials[primitive.materialIndex].roughnessFactor;
-					push.metallicFactor = materials[primitive.materialIndex].metallicFactor;
+					push.baseColorFactor = materials[primitive.materialIndex].shaderData.values.baseColorFactor;
+					push.roughnessFactor = materials[primitive.materialIndex].shaderData.values.roughnessFactor;
+					push.metallicFactor = materials[primitive.materialIndex].shaderData.values.metallicFactor;
 					// Pass the final matrix to the vertex shader using push constants
 					vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstant), &push);
 
@@ -459,6 +803,19 @@ class VulkanExample : public VulkanExampleBase
 {
 public:
 	bool wireframe = false;
+	bool animationPlay = true;
+	int32_t animationIndex = 0;
+	float animationTime = 0.0f;
+	std::vector<std::string> animationNames;
+	hw1::Timer timer;
+	float fixedUpdateDelta = 0.016f;
+	float fixedUpdateTimer = 0.0f;
+	bool enableToneMapping = true;
+	bool enableVignette = true;
+	bool enableGrain = true;
+	bool enableChromaticAberration = true;
+	float lightIntensity = 5.0f;
+	glm::vec3 lightDirection = glm::vec3(0.25f, 1.0f, 0.25f);
 
 	VulkanglTFModel glTFModel;
 
@@ -468,16 +825,25 @@ public:
 			glm::mat4 projection;
 			glm::mat4 model;
 			// Change point light to directional light to simplify shadow mapping =)
-			glm::vec4 lightDir = glm::vec4(1.0f, 1.0f, -1.0f, 1.0f);
+			glm::vec4 lightDir;
 			glm::vec4 viewPos;
 			glm::mat4 lightMatrix;
-			float frustumSize;
-			float shadowMapSize;
+			float lightIntensity;
 		} values;
 	} shaderData;
 
+	struct PostprocessingData {
+		vks::Buffer buffer;
+		struct Values {
+			int enableToneMapping;
+			int enableVignette;
+			int enableGrain;
+			int enableChromaticAberration;
+		} values;
+	} postprocessingData;
+
 	struct Pipelines {
-		VkPipeline solid;
+		VkPipeline solid = VK_NULL_HANDLE;
 		VkPipeline wireframe = VK_NULL_HANDLE;
 		VkPipeline shadow = VK_NULL_HANDLE;
 		VkPipeline filter = VK_NULL_HANDLE;
@@ -491,29 +857,27 @@ public:
 	} pipelineLayouts;
 
 	VkDescriptorSet descriptorSet;
+	VkDescriptorSet postprocessingDataDescriptorSet;
 
 	struct DescriptorSetLayouts {
 		VkDescriptorSetLayout matrices;
 		VkDescriptorSetLayout textures;
 		VkDescriptorSetLayout shadow;
 		VkDescriptorSetLayout postprocessing;
+		VkDescriptorSetLayout animation;
+		VkDescriptorSetLayout postprocessingData;
 	} descriptorSetLayouts;
 
 	// Image resources
-	struct VulkanImage {
-		VkImage image;
-		VkDeviceMemory mem;
-		VkImageView view;
-		VkSampler sampler;
-	};
-	VulkanImage shadowMapColorImage;
-	VkDescriptorSet shadowMapColorDescriptorSet;
-	VulkanImage shadowMapDepthImage;
-	VulkanImage shadowMapFilteredImage;
-	VkDescriptorSet shadowMapFilteredDescriptorSet;
-	VulkanImage renderTargetColorImage;
-	VulkanImage renderTargetDepthImage;
-	VkDescriptorSet renderTargetDescriptorSet;
+	hw1::Image2D shadowMapColorImage;
+	hw1::Image2D shadowMapDepthImage;
+	hw1::Image2D shadowMapFilteredImage;
+	hw1::Image2D renderTargetColorImage;
+	hw1::Image2D renderTargetDepthImage;
+	// Descriptor sets for images to be sampled in shader
+	VkDescriptorSet shadowMapColorDescriptorSet = VK_NULL_HANDLE;
+	VkDescriptorSet shadowMapFilteredDescriptorSet = VK_NULL_HANDLE;
+	VkDescriptorSet renderTargetDescriptorSet = VK_NULL_HANDLE;
 
 	// Use shadowRenderPass for rendering shadow
 	// Use mainRenderPass for shading
@@ -554,6 +918,8 @@ public:
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.textures, nullptr);
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.shadow, nullptr);
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.postprocessing, nullptr);
+		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.animation, nullptr);
+		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.postprocessingData, nullptr);
 
 		vkDestroyFramebuffer(device, shadowFrameBuffer, nullptr);
 		vkDestroyFramebuffer(device, filterFrameBuffer, nullptr);
@@ -562,28 +928,14 @@ public:
 		vkDestroyRenderPass(device, filterRenderPass, nullptr);
 		vkDestroyRenderPass(device, mainRenderPass, nullptr);
 
-		vkDestroyImageView(device, shadowMapColorImage.view, nullptr);
-		vkDestroyImage(device, shadowMapColorImage.image, nullptr);
-		vkDestroySampler(device, shadowMapColorImage.sampler, nullptr);
-		vkFreeMemory(device, shadowMapColorImage.mem, nullptr);
-		vkDestroyImageView(device, shadowMapFilteredImage.view, nullptr);
-		vkDestroyImage(device, shadowMapFilteredImage.image, nullptr);
-		vkDestroySampler(device, shadowMapFilteredImage.sampler, nullptr);
-		vkFreeMemory(device, shadowMapFilteredImage.mem, nullptr);
-		vkDestroyImageView(device, shadowMapDepthImage.view, nullptr);
-		vkDestroyImage(device, shadowMapDepthImage.image, nullptr);
-		// No sampler is created for shadowMapDepthImage
-		vkFreeMemory(device, shadowMapDepthImage.mem, nullptr);
-		vkDestroyImageView(device, renderTargetColorImage.view, nullptr);
-		vkDestroyImage(device, renderTargetColorImage.image, nullptr);
-		vkDestroySampler(device, renderTargetColorImage.sampler, nullptr);
-		vkFreeMemory(device, renderTargetColorImage.mem, nullptr);
-		vkDestroyImageView(device, renderTargetDepthImage.view, nullptr);
-		vkDestroyImage(device, renderTargetDepthImage.image, nullptr);
-		// No sampler is created for renderTargetDepthImage
-		vkFreeMemory(device, renderTargetDepthImage.mem, nullptr);
+		hw1::destroyImage2D(device, &shadowMapColorImage);
+		hw1::destroyImage2D(device, &shadowMapDepthImage);
+		hw1::destroyImage2D(device, &shadowMapFilteredImage);
+		hw1::destroyImage2D(device, &renderTargetColorImage);
+		hw1::destroyImage2D(device, &renderTargetDepthImage);
 
 		shaderData.buffer.destroy();
+		postprocessingData.buffer.destroy();
 	}
 
 	virtual void getEnabledFeatures()
@@ -715,6 +1067,8 @@ public:
 				vkCmdSetScissor(drawCmdBuffers[i], 0, 1, &scissor);
 				// Bind render target descriptor to set 0
 				vkCmdBindDescriptorSets(drawCmdBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayouts.postprocessing, 0, 1, &renderTargetDescriptorSet, 0, nullptr);
+				// Bind parameter descriptor to set 0
+				vkCmdBindDescriptorSets(drawCmdBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayouts.postprocessing, 1, 1, &postprocessingDataDescriptorSet, 0, nullptr);
 				vkCmdBindPipeline(drawCmdBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.postprocessing);
 				vkCmdDraw(drawCmdBuffers[i], 3, 1, 0, 0);
 				drawUI(drawCmdBuffers[i]);
@@ -754,7 +1108,21 @@ public:
 			const tinygltf::Scene& scene = glTFInput.scenes[0];
 			for (size_t i = 0; i < scene.nodes.size(); i++) {
 				const tinygltf::Node node = glTFInput.nodes[scene.nodes[i]];
-				glTFModel.loadNode(node, glTFInput, nullptr, indexBuffer, vertexBuffer);
+				glTFModel.loadNode(node, scene.nodes[i], glTFInput, nullptr, indexBuffer, vertexBuffer);
+			}
+			glTFModel.loadAnimations(glTFInput);
+			glTFModel.loadSkins(glTFInput);
+			for (auto& node : glTFModel.linearNodes) {
+				if (node->skinIndex > -1) {
+					node->skin = &glTFModel.skins[node->skinIndex];
+				}
+			}
+			for (auto& node : glTFModel.nodes) {
+				// [TODO] Only need to update nodes with mesh (!mesh.primitives.empty())
+				node->update();
+			}
+			for (auto& anim : glTFModel.animations) {
+				animationNames.push_back(anim.name);
 			}
 		}
 		else {
@@ -847,15 +1215,15 @@ public:
 		*/
 
 		std::vector<VkDescriptorPoolSize> poolSizes = {
-			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1),
+			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<uint32_t>(glTFModel.linearNodes.size()) + static_cast<uint32_t>(glTFModel.materials.size()) + 2),
 			// One combined image sampler per model image/texture + two for shadow map + one for filtered map + tow for postprocessing render target
 			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<uint32_t>(glTFModel.images.size()) + 5),
 		};
-		// One set for matrices and one per model image/texture
-		// Use Only three sets (personal favor), one for scene parameters and one for material parameters and one for textures
-		// const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.images.size()) + 1;
-		const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.materials.size()) + 4;
+		// One set for matrices + one per model image/texture + one per node animation + one for shadow map 
+		//  + one for filtered shadow map + one for postprocessing input + one for postprocessing uniform buffer
+		const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.materials.size()) + static_cast<uint32_t>(glTFModel.linearNodes.size()) + 5;
 		VkDescriptorPoolCreateInfo descriptorPoolInfo = vks::initializers::descriptorPoolCreateInfo(poolSizes, maxSetCount);
+		descriptorPoolInfo.flags |= VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
 		VK_CHECK_RESULT(vkCreateDescriptorPool(device, &descriptorPoolInfo, nullptr, &descriptorPool));
 
 		// Descriptor set layout for passing matrices
@@ -869,6 +1237,7 @@ public:
 			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 2),
 			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 3),
 			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 4),
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 5),
 		};
 		descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(setLayoutBindings.data(), static_cast<uint32_t>(setLayoutBindings.size()));
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.textures));
@@ -878,20 +1247,33 @@ public:
 		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0);
 		descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(&setLayoutBinding, 1);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.postprocessing));
+		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
+		descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(&setLayoutBinding, 1);
+		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.animation));
+		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 0);
+		descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(&setLayoutBinding, 1);
+		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.postprocessingData));
 
-		// Pipeline layout using both descriptor sets (set 0 = matrices, set 1 = material, set 2 = shadow)
-		std::array<VkDescriptorSetLayout, 3> setLayouts = { descriptorSetLayouts.matrices, descriptorSetLayouts.textures, descriptorSetLayouts.shadow };
-		VkPipelineLayoutCreateInfo pipelineLayoutCI= vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(), static_cast<uint32_t>(setLayouts.size()));
+		// Pipeline layout using both descriptor sets (set 0 = matrices, set 1 = material, set 2 = shadow, set 3 = animation)
+		std::vector<VkDescriptorSetLayout> setLayouts = { 
+			descriptorSetLayouts.matrices,
+			descriptorSetLayouts.textures,
+			descriptorSetLayouts.shadow,
+			descriptorSetLayouts.animation
+		};
+		VkPipelineLayoutCreateInfo pipelineLayoutCI = vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(), static_cast<uint32_t>(setLayouts.size()));
 		// We will use push constants to push the local matrices of a primitive to the vertex shader
 		VkPushConstantRange pushConstantRange = vks::initializers::pushConstantRange(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(VulkanglTFModel::PushConstant), 0);
 		// Push constant ranges are part of the pipeline layout
 		pipelineLayoutCI.pushConstantRangeCount = 1;
 		pipelineLayoutCI.pPushConstantRanges = &pushConstantRange;
 		VK_CHECK_RESULT(vkCreatePipelineLayout(device, &pipelineLayoutCI, nullptr, &pipelineLayouts.main));
-
-		pipelineLayoutCI = vks::initializers::pipelineLayoutCreateInfo(&descriptorSetLayouts.postprocessing, 1);
+		setLayouts = {
+			descriptorSetLayouts.postprocessing,
+			descriptorSetLayouts.postprocessingData,
+		};
+		pipelineLayoutCI = vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(), static_cast<uint32_t>(setLayouts.size()));
 		VK_CHECK_RESULT(vkCreatePipelineLayout(device, &pipelineLayoutCI, nullptr, &pipelineLayouts.postprocessing));
-
 		pipelineLayoutCI = vks::initializers::pipelineLayoutCreateInfo(&descriptorSetLayouts.shadow, 1);
 		VK_CHECK_RESULT(vkCreatePipelineLayout(device, &pipelineLayoutCI, nullptr, &pipelineLayouts.filter));
 
@@ -900,6 +1282,13 @@ public:
 		VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet));
 		VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(descriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &shaderData.buffer.descriptor);
 		vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+
+		// Descriptor set for postprocessing parameters
+		allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.postprocessingData, 1);
+		VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &postprocessingDataDescriptorSet));
+		writeDescriptorSet = vks::initializers::writeDescriptorSet(postprocessingDataDescriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &postprocessingData.buffer.descriptor);
+		vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+
 		// Descriptor set for materials
 		for (auto& mat : glTFModel.materials) {
 			const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.textures, 1);
@@ -917,273 +1306,62 @@ public:
 			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(mat.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0,
 				imageDescriptors.data(), static_cast<uint32_t>(imageDescriptors.size()));
 			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+			writeDescriptorSet = vks::initializers::writeDescriptorSet(mat.descriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 5, &mat.shaderData.buffer.descriptor);
+			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+		}
+
+		// Descriptor sets for animations
+		for (auto& node : glTFModel.linearNodes) {
+			VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.animation, 1);
+			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &node->mesh.descriptorSet));
+			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(node->mesh.descriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &node->mesh.shaderData.buffer.descriptor);
+			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 		}
 	}
 
-	void prepareRenderPass()
+	void recreateRenderPass()
 	{
-		{
-			std::array<VkAttachmentDescription, 2> attachments = {};
-			// Color attachment
-			attachments[0].format = SHADOW_MAP_COLOR_FORMAT;
-			attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-			attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-			attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-			attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-			attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-			attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-			attachments[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-			// Depth attachment
-			attachments[1].format = depthFormat;
-			attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
-			attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-			attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-			attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-			attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-			attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-			attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+		if (shadowRenderPass != VK_NULL_HANDLE) vkDestroyRenderPass(device, shadowRenderPass, nullptr);
+		if (filterRenderPass != VK_NULL_HANDLE) vkDestroyRenderPass(device, filterRenderPass, nullptr);
+		if (mainRenderPass != VK_NULL_HANDLE) vkDestroyRenderPass(device, mainRenderPass, nullptr);
 
-			VkAttachmentReference colorReference = {};
-			colorReference.attachment = 0;
-			colorReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-			VkAttachmentReference depthReference = {};
-			depthReference.attachment = 1;
-			depthReference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-			VkSubpassDescription subpassDescription = {};
-			subpassDescription.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-			subpassDescription.colorAttachmentCount = 1;
-			subpassDescription.pColorAttachments = &colorReference;
-			subpassDescription.pDepthStencilAttachment = &depthReference;
-			subpassDescription.inputAttachmentCount = 0;
-			subpassDescription.pInputAttachments = nullptr;
-			subpassDescription.preserveAttachmentCount = 0;
-			subpassDescription.pPreserveAttachments = nullptr;
-			subpassDescription.pResolveAttachments = nullptr;
-
-			// Subpass dependencies for layout transitions
-			std::array<VkSubpassDependency, 2> dependencies;
-
-			dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-			dependencies[0].dstSubpass = 0;
-			dependencies[0].srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-			dependencies[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-			dependencies[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-			dependencies[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-			dependencies[0].dependencyFlags = 0;
-
-			dependencies[1].srcSubpass = VK_SUBPASS_EXTERNAL;
-			dependencies[1].dstSubpass = 0;
-			dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-			dependencies[1].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-			dependencies[1].srcAccessMask = 0;
-			dependencies[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-			dependencies[1].dependencyFlags = 0;
-
-			VkRenderPassCreateInfo renderPassCI = {};
-			renderPassCI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-			renderPassCI.attachmentCount = static_cast<uint32_t>(attachments.size());
-			renderPassCI.pAttachments = attachments.data();
-			renderPassCI.subpassCount = 1;
-			renderPassCI.pSubpasses = &subpassDescription;
-			renderPassCI.dependencyCount = static_cast<uint32_t>(dependencies.size());
-			renderPassCI.pDependencies = dependencies.data();
-
-			VK_CHECK_RESULT(vkCreateRenderPass(device, &renderPassCI, nullptr, &shadowRenderPass));
-		}
-		{
-			std::array<VkAttachmentDescription, 1> attachments = {};
-			// Color attachment
-			attachments[0].format = SHADOW_MAP_COLOR_FORMAT;
-			attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-			attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-			attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-			attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-			attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-			attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-			attachments[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-			VkAttachmentReference colorReference = {};
-			colorReference.attachment = 0;
-			colorReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-			VkSubpassDescription subpassDescription = {};
-			subpassDescription.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-			subpassDescription.colorAttachmentCount = 1;
-			subpassDescription.pColorAttachments = &colorReference;
-			subpassDescription.pDepthStencilAttachment = nullptr;
-			subpassDescription.inputAttachmentCount = 0;
-			subpassDescription.pInputAttachments = nullptr;
-			subpassDescription.preserveAttachmentCount = 0;
-			subpassDescription.pPreserveAttachments = nullptr;
-			subpassDescription.pResolveAttachments = nullptr;
-
-			// Subpass dependencies for layout transitions
-			std::array<VkSubpassDependency, 1> dependencies;
-
-			dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-			dependencies[0].dstSubpass = 0;
-			dependencies[0].srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-			dependencies[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-			dependencies[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-			dependencies[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-			dependencies[0].dependencyFlags = 0;
-
-			VkRenderPassCreateInfo renderPassCI = {};
-			renderPassCI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-			renderPassCI.attachmentCount = static_cast<uint32_t>(attachments.size());
-			renderPassCI.pAttachments = attachments.data();
-			renderPassCI.subpassCount = 1;
-			renderPassCI.pSubpasses = &subpassDescription;
-			renderPassCI.dependencyCount = static_cast<uint32_t>(dependencies.size());
-			renderPassCI.pDependencies = dependencies.data();
-
-			VK_CHECK_RESULT(vkCreateRenderPass(device, &renderPassCI, nullptr, &filterRenderPass));
-		}
-		{
-			std::array<VkAttachmentDescription, 2> attachments = {};
-			// Color attachment
-			attachments[0].format = RENDER_TARGET_COLOR_FORMAT;
-			attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-			attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-			attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-			attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-			attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-			attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-			attachments[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-			// Depth attachment
-			attachments[1].format = depthFormat;
-			attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
-			attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-			attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-			attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-			attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-			attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-			attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-			VkAttachmentReference colorReference = {};
-			colorReference.attachment = 0;
-			colorReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-			VkAttachmentReference depthReference = {};
-			depthReference.attachment = 1;
-			depthReference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-			VkSubpassDescription subpassDescription = {};
-			subpassDescription.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-			subpassDescription.colorAttachmentCount = 1;
-			subpassDescription.pColorAttachments = &colorReference;
-			subpassDescription.pDepthStencilAttachment = &depthReference;
-			subpassDescription.inputAttachmentCount = 0;
-			subpassDescription.pInputAttachments = nullptr;
-			subpassDescription.preserveAttachmentCount = 0;
-			subpassDescription.pPreserveAttachments = nullptr;
-			subpassDescription.pResolveAttachments = nullptr;
-
-			// Subpass dependencies for layout transitions
-			std::array<VkSubpassDependency, 2> dependencies;
-
-			dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-			dependencies[0].dstSubpass = 0;
-			dependencies[0].srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-			dependencies[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-			dependencies[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-			dependencies[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-			dependencies[0].dependencyFlags = 0;
-
-			dependencies[1].srcSubpass = VK_SUBPASS_EXTERNAL;
-			dependencies[1].dstSubpass = 0;
-			dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-			dependencies[1].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-			dependencies[1].srcAccessMask = 0;
-			dependencies[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-			dependencies[1].dependencyFlags = 0;
-
-			VkRenderPassCreateInfo renderPassCI = {};
-			renderPassCI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-			renderPassCI.attachmentCount = static_cast<uint32_t>(attachments.size());
-			renderPassCI.pAttachments = attachments.data();
-			renderPassCI.subpassCount = 1;
-			renderPassCI.pSubpasses = &subpassDescription;
-			renderPassCI.dependencyCount = static_cast<uint32_t>(dependencies.size());
-			renderPassCI.pDependencies = dependencies.data();
-
-			VK_CHECK_RESULT(vkCreateRenderPass(device, &renderPassCI, nullptr, &mainRenderPass));
-		}
+		hw1::createRenderPass(device, &shadowRenderPass, SHADOW_MAP_COLOR_FORMAT, depthFormat);
+		hw1::createRenderPass(device, &filterRenderPass, SHADOW_MAP_COLOR_FORMAT);
+		hw1::createRenderPass(device, &mainRenderPass, RENDER_TARGET_COLOR_FORMAT, depthFormat);
 	}
 
-	void prepareFrameBuffer()
+	void recreateFrameBuffer()
 	{
-		{
-			std::array<VkImageView, 2> attachments = {
-				shadowMapColorImage.view,
-				shadowMapDepthImage.view,
-			};
+		if (shadowFrameBuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(device, shadowFrameBuffer, nullptr);
+		if (filterFrameBuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(device, filterFrameBuffer, nullptr);
+		if (mainFrameBuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(device, mainFrameBuffer, nullptr);
 
-			VkFramebufferCreateInfo frameBufferCI = {};
-			frameBufferCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-			frameBufferCI.pNext = NULL;
-			frameBufferCI.renderPass = shadowRenderPass;
-			frameBufferCI.attachmentCount = static_cast<uint32_t>(attachments.size());
-			frameBufferCI.pAttachments = attachments.data();
-			frameBufferCI.width = SHADOW_MAP_SIZE;
-			frameBufferCI.height = SHADOW_MAP_SIZE;
-			frameBufferCI.layers = 1;
-
-			VK_CHECK_RESULT(vkCreateFramebuffer(device, &frameBufferCI, nullptr, &shadowFrameBuffer));
-		}
-		{
-			std::array<VkImageView, 1> attachments = {
-				shadowMapFilteredImage.view,
-			};
-
-			VkFramebufferCreateInfo frameBufferCI = {};
-			frameBufferCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-			frameBufferCI.pNext = NULL;
-			frameBufferCI.renderPass = filterRenderPass;
-			frameBufferCI.attachmentCount = static_cast<uint32_t>(attachments.size());
-			frameBufferCI.pAttachments = attachments.data();
-			frameBufferCI.width = SHADOW_MAP_SIZE;
-			frameBufferCI.height = SHADOW_MAP_SIZE;
-			frameBufferCI.layers = 1;
-
-			VK_CHECK_RESULT(vkCreateFramebuffer(device, &frameBufferCI, nullptr, &filterFrameBuffer));
-		}
-		{
-			std::array<VkImageView, 2> attachments = {
-				renderTargetColorImage.view,
-				renderTargetDepthImage.view,
-			};
-
-			VkFramebufferCreateInfo frameBufferCI = {};
-			frameBufferCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-			frameBufferCI.pNext = NULL;
-			frameBufferCI.renderPass = mainRenderPass;
-			frameBufferCI.attachmentCount = static_cast<uint32_t>(attachments.size());
-			frameBufferCI.pAttachments = attachments.data();
-			frameBufferCI.width = width;
-			frameBufferCI.height = height;
-			frameBufferCI.layers = 1;
-
-			VK_CHECK_RESULT(vkCreateFramebuffer(device, &frameBufferCI, nullptr, &mainFrameBuffer));
-		}
+		hw1::createFrameBuffer(device, &shadowFrameBuffer, { SHADOW_MAP_SIZE , SHADOW_MAP_SIZE }, shadowRenderPass, shadowMapColorImage.view, shadowMapDepthImage.view);
+		hw1::createFrameBuffer(device, &filterFrameBuffer, { SHADOW_MAP_SIZE , SHADOW_MAP_SIZE }, filterRenderPass, shadowMapFilteredImage.view);
+		hw1::createFrameBuffer(device, &mainFrameBuffer, { width , height }, mainRenderPass, renderTargetColorImage.view, renderTargetDepthImage.view);
 	}
 
-	void prepareLightMatrix()
+	void updateLightInfo()
 	{
-		auto lightDir = glm::normalize(glm::vec3(shaderData.values.lightDir));
+		auto lightDir = glm::normalize(lightDirection);
 
 		auto proj = glm::ortho(-2.0f, 2.0f, -2.0f, 2.0f, 0.01f, 10.0f);
+		// Flip Y
+		proj[1][1] *= -1.0f;
+
 		auto view = glm::lookAt(lightDir * 2.0f, glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
 
-		shaderData.values.frustumSize = 20.0f;
-		shaderData.values.shadowMapSize = SHADOW_MAP_SIZE;
 		shaderData.values.lightMatrix = proj * view;
+		shaderData.values.lightDir = glm::vec4(lightDir, 0.0);
+		shaderData.values.lightIntensity = lightIntensity;
 	}
 
-	void prepareMainPipelines()
+	void recreateMainPipelines()
 	{
+		if (pipelines.solid != VK_NULL_HANDLE) vkDestroyPipeline(device, pipelines.solid, nullptr);
+		if (pipelines.wireframe != VK_NULL_HANDLE) vkDestroyPipeline(device, pipelines.wireframe, nullptr);
+		if (pipelines.shadow != VK_NULL_HANDLE) vkDestroyPipeline(device, pipelines.shadow, nullptr);
+
 		VkPipelineInputAssemblyStateCreateInfo inputAssemblyStateCI = vks::initializers::pipelineInputAssemblyStateCreateInfo(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_FALSE);
 		VkPipelineRasterizationStateCreateInfo rasterizationStateCI = vks::initializers::pipelineRasterizationStateCreateInfo(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0);
 		// Enable color blend
@@ -1205,10 +1383,12 @@ public:
 			vks::initializers::vertexInputBindingDescription(0, sizeof(VulkanglTFModel::Vertex), VK_VERTEX_INPUT_RATE_VERTEX),
 		};
 		const std::vector<VkVertexInputAttributeDescription> vertexInputAttributes = {
-			vks::initializers::vertexInputAttributeDescription(0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, pos)),	// Location 0: Position
-			vks::initializers::vertexInputAttributeDescription(0, 1, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, normal)),// Location 1: Normal
-			vks::initializers::vertexInputAttributeDescription(0, 2, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, uv)),	// Location 2: Texture coordinates
-			vks::initializers::vertexInputAttributeDescription(0, 3, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, color)),	// Location 3: Color
+			vks::initializers::vertexInputAttributeDescription(0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, pos)),		// Location 0: Position
+			vks::initializers::vertexInputAttributeDescription(0, 1, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, normal)),	// Location 1: Normal
+			vks::initializers::vertexInputAttributeDescription(0, 2, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, uv)),		// Location 2: Texture coordinates
+			vks::initializers::vertexInputAttributeDescription(0, 3, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, color)),		// Location 3: Color
+			vks::initializers::vertexInputAttributeDescription(0, 4, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VulkanglTFModel::Vertex, joint)),	// Location 4: Joint
+			vks::initializers::vertexInputAttributeDescription(0, 5, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VulkanglTFModel::Vertex, weight)),	// Location 5: Weight
 		};
 		VkPipelineVertexInputStateCreateInfo vertexInputStateCI = vks::initializers::pipelineVertexInputStateCreateInfo();
 		vertexInputStateCI.vertexBindingDescriptionCount = static_cast<uint32_t>(vertexInputBindings.size());
@@ -1253,8 +1433,10 @@ public:
 		VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCI, nullptr, &pipelines.shadow));
 	}
 
-	void preparePostprocessingPipeline()
+	void recreatePostprocessingPipeline()
 	{
+		if (pipelines.postprocessing != VK_NULL_HANDLE) vkDestroyPipeline(device, pipelines.postprocessing, nullptr);
+
 		VkPipelineInputAssemblyStateCreateInfo inputAssemblyStateCI = vks::initializers::pipelineInputAssemblyStateCreateInfo(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_FALSE);
 		VkPipelineRasterizationStateCreateInfo rasterizationStateCI = vks::initializers::pipelineRasterizationStateCreateInfo(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0);
 		VkPipelineColorBlendAttachmentState blendAttachmentStateCI = vks::initializers::pipelineColorBlendAttachmentState(0xf, VK_FALSE);
@@ -1285,8 +1467,10 @@ public:
 		VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCI, nullptr, &pipelines.postprocessing));
 	}
 
-	void prepareFilterPipeline()
+	void recreateFilterPipeline()
 	{
+		if (pipelines.filter != VK_NULL_HANDLE) vkDestroyPipeline(device, pipelines.filter, nullptr);
+
 		VkPipelineInputAssemblyStateCreateInfo inputAssemblyStateCI = vks::initializers::pipelineInputAssemblyStateCreateInfo(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_FALSE);
 		VkPipelineRasterizationStateCreateInfo rasterizationStateCI = vks::initializers::pipelineRasterizationStateCreateInfo(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0);
 		VkPipelineColorBlendAttachmentState blendAttachmentStateCI = vks::initializers::pipelineColorBlendAttachmentState(0xf, VK_FALSE);
@@ -1330,301 +1514,134 @@ public:
 		// Map persistent
 		VK_CHECK_RESULT(shaderData.buffer.map());
 
+		VK_CHECK_RESULT(vulkanDevice->createBuffer(
+			VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			&postprocessingData.buffer,
+			sizeof(postprocessingData.values)));
+
+		VK_CHECK_RESULT(postprocessingData.buffer.map());
+
 		updateUniformBuffers();
 	}
 
-	void prepareResources() {
+	void recreateResources() {
+		hw1::destroyImage2D(device, &shadowMapColorImage);
+		hw1::destroyImage2D(device, &shadowMapDepthImage);
+		hw1::destroyImage2D(device, &shadowMapFilteredImage);
+		hw1::destroyImage2D(device, &renderTargetColorImage);
+		hw1::destroyImage2D(device, &renderTargetDepthImage);
+
+		hw1::createImage2D(*vulkanDevice, &shadowMapColorImage, SHADOW_MAP_COLOR_FORMAT, { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1 },
+			VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+
+		hw1::createImage2D(*vulkanDevice, &shadowMapDepthImage, depthFormat, { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1 },
+			VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+
+		hw1::createImage2D(*vulkanDevice, &shadowMapFilteredImage, SHADOW_MAP_COLOR_FORMAT, { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1 },
+			VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+
+		hw1::createImage2D(*vulkanDevice, &renderTargetColorImage, RENDER_TARGET_COLOR_FORMAT, { width, height, 1 },
+			VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+
+		hw1::createImage2D(*vulkanDevice, &renderTargetDepthImage, depthFormat, { width, height, 1 },
+			VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+
+		if (shadowMapColorDescriptorSet != VK_NULL_HANDLE) vkFreeDescriptorSets(device, descriptorPool, 1, &shadowMapColorDescriptorSet);
+		if (shadowMapFilteredDescriptorSet != VK_NULL_HANDLE) vkFreeDescriptorSets(device, descriptorPool, 1, &shadowMapFilteredDescriptorSet);
+		if (renderTargetDescriptorSet != VK_NULL_HANDLE) vkFreeDescriptorSets(device, descriptorPool, 1, &renderTargetDescriptorSet);
+
 		{
-			VkFormat format = SHADOW_MAP_COLOR_FORMAT;
-
-			VkImageCreateInfo imageCI{};
-			imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-			imageCI.imageType = VK_IMAGE_TYPE_2D;
-			imageCI.format = format;
-			imageCI.extent = { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1 };
-			imageCI.mipLevels = 1;
-			imageCI.arrayLayers = 1;
-			imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
-			imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
-			imageCI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-
-			VK_CHECK_RESULT(vkCreateImage(device, &imageCI, nullptr, &shadowMapColorImage.image));
-			VkMemoryRequirements memReqs{};
-			vkGetImageMemoryRequirements(device, shadowMapColorImage.image, &memReqs);
-
-			VkMemoryAllocateInfo memAllloc{};
-			memAllloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-			memAllloc.allocationSize = memReqs.size;
-			memAllloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-			VK_CHECK_RESULT(vkAllocateMemory(device, &memAllloc, nullptr, &shadowMapColorImage.mem));
-			VK_CHECK_RESULT(vkBindImageMemory(device, shadowMapColorImage.image, shadowMapColorImage.mem, 0));
-
-			VkImageViewCreateInfo imageViewCI{};
-			imageViewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-			imageViewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-			imageViewCI.image = shadowMapColorImage.image;
-			imageViewCI.format = format;
-			imageViewCI.subresourceRange.baseMipLevel = 0;
-			imageViewCI.subresourceRange.levelCount = 1;
-			imageViewCI.subresourceRange.baseArrayLayer = 0;
-			imageViewCI.subresourceRange.layerCount = 1;
-			imageViewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewCI, nullptr, &shadowMapColorImage.view));
-
-			VkSamplerCreateInfo samplerCI = {};
-			samplerCI.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-			samplerCI.magFilter = VK_FILTER_LINEAR;
-			samplerCI.minFilter = VK_FILTER_LINEAR;
-			samplerCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-			samplerCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.mipLodBias = 0.0f;
-			samplerCI.compareOp = VK_COMPARE_OP_NEVER;
-			samplerCI.minLod = 0.0f;
-			samplerCI.maxLod = 0.0f;
-			samplerCI.maxAnisotropy = 1.0f;
-			VK_CHECK_RESULT(vkCreateSampler(device, &samplerCI, nullptr, &shadowMapColorImage.sampler));
-
-			VkDescriptorImageInfo descriptorImageInfo{};
-			descriptorImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-			descriptorImageInfo.imageView = shadowMapColorImage.view;
-			descriptorImageInfo.sampler = shadowMapColorImage.sampler;
-
 			const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.shadow, 1);
 			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &shadowMapColorDescriptorSet));
-			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(shadowMapColorDescriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &descriptorImageInfo);
+			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(shadowMapColorDescriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &shadowMapColorImage.descriptor);
 			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 		}
 		{
-			VkFormat format = depthFormat;
-
-			VkImageCreateInfo imageCI{};
-			imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-			imageCI.imageType = VK_IMAGE_TYPE_2D;
-			imageCI.format = format;
-			imageCI.extent = { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1 };
-			imageCI.mipLevels = 1;
-			imageCI.arrayLayers = 1;
-			imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
-			imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
-			imageCI.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-
-			VK_CHECK_RESULT(vkCreateImage(device, &imageCI, nullptr, &shadowMapDepthImage.image));
-			VkMemoryRequirements memReqs{};
-			vkGetImageMemoryRequirements(device, shadowMapDepthImage.image, &memReqs);
-
-			VkMemoryAllocateInfo memAllloc{};
-			memAllloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-			memAllloc.allocationSize = memReqs.size;
-			memAllloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-			VK_CHECK_RESULT(vkAllocateMemory(device, &memAllloc, nullptr, &shadowMapDepthImage.mem));
-			VK_CHECK_RESULT(vkBindImageMemory(device, shadowMapDepthImage.image, shadowMapDepthImage.mem, 0));
-
-			VkImageViewCreateInfo imageViewCI{};
-			imageViewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-			imageViewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-			imageViewCI.image = shadowMapDepthImage.image;
-			imageViewCI.format = format;
-			imageViewCI.subresourceRange.baseMipLevel = 0;
-			imageViewCI.subresourceRange.levelCount = 1;
-			imageViewCI.subresourceRange.baseArrayLayer = 0;
-			imageViewCI.subresourceRange.layerCount = 1;
-			imageViewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewCI, nullptr, &shadowMapDepthImage.view));
-		}
-		{
-			VkFormat format = SHADOW_MAP_COLOR_FORMAT;
-
-			VkImageCreateInfo imageCI{};
-			imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-			imageCI.imageType = VK_IMAGE_TYPE_2D;
-			imageCI.format = format;
-			imageCI.extent = { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1 };
-			imageCI.mipLevels = 1;
-			imageCI.arrayLayers = 1;
-			imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
-			imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
-			imageCI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-
-			VK_CHECK_RESULT(vkCreateImage(device, &imageCI, nullptr, &shadowMapFilteredImage.image));
-			VkMemoryRequirements memReqs{};
-			vkGetImageMemoryRequirements(device, shadowMapFilteredImage.image, &memReqs);
-
-			VkMemoryAllocateInfo memAllloc{};
-			memAllloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-			memAllloc.allocationSize = memReqs.size;
-			memAllloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-			VK_CHECK_RESULT(vkAllocateMemory(device, &memAllloc, nullptr, &shadowMapFilteredImage.mem));
-			VK_CHECK_RESULT(vkBindImageMemory(device, shadowMapFilteredImage.image, shadowMapFilteredImage.mem, 0));
-
-			VkImageViewCreateInfo imageViewCI{};
-			imageViewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-			imageViewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-			imageViewCI.image = shadowMapFilteredImage.image;
-			imageViewCI.format = format;
-			imageViewCI.subresourceRange.baseMipLevel = 0;
-			imageViewCI.subresourceRange.levelCount = 1;
-			imageViewCI.subresourceRange.baseArrayLayer = 0;
-			imageViewCI.subresourceRange.layerCount = 1;
-			imageViewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewCI, nullptr, &shadowMapFilteredImage.view));
-
-			VkSamplerCreateInfo samplerCI = {};
-			samplerCI.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-			samplerCI.magFilter = VK_FILTER_LINEAR;
-			samplerCI.minFilter = VK_FILTER_LINEAR;
-			samplerCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-			samplerCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.mipLodBias = 0.0f;
-			samplerCI.compareOp = VK_COMPARE_OP_NEVER;
-			samplerCI.minLod = 0.0f;
-			samplerCI.maxLod = 0.0f;
-			samplerCI.maxAnisotropy = 1.0f;
-			VK_CHECK_RESULT(vkCreateSampler(device, &samplerCI, nullptr, &shadowMapFilteredImage.sampler));
-
-			VkDescriptorImageInfo descriptorImageInfo{};
-			descriptorImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-			descriptorImageInfo.imageView = shadowMapFilteredImage.view;
-			descriptorImageInfo.sampler = shadowMapFilteredImage.sampler;
-
 			const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.shadow, 1);
 			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &shadowMapFilteredDescriptorSet));
-			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(shadowMapFilteredDescriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &descriptorImageInfo);
+			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(shadowMapFilteredDescriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &shadowMapFilteredImage.descriptor);
 			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 		}
 		{
-			VkFormat format = RENDER_TARGET_COLOR_FORMAT;
-
-			VkImageCreateInfo imageCI{};
-			imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-			imageCI.imageType = VK_IMAGE_TYPE_2D;
-			imageCI.format = format;
-			imageCI.extent = { width, height, 1 };
-			imageCI.mipLevels = 1;
-			imageCI.arrayLayers = 1;
-			imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
-			imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
-			imageCI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-
-			VK_CHECK_RESULT(vkCreateImage(device, &imageCI, nullptr, &renderTargetColorImage.image));
-			VkMemoryRequirements memReqs{};
-			vkGetImageMemoryRequirements(device, renderTargetColorImage.image, &memReqs);
-
-			VkMemoryAllocateInfo memAllloc{};
-			memAllloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-			memAllloc.allocationSize = memReqs.size;
-			memAllloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-			VK_CHECK_RESULT(vkAllocateMemory(device, &memAllloc, nullptr, &renderTargetColorImage.mem));
-			VK_CHECK_RESULT(vkBindImageMemory(device, renderTargetColorImage.image, renderTargetColorImage.mem, 0));
-
-			VkImageViewCreateInfo imageViewCI{};
-			imageViewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-			imageViewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-			imageViewCI.image = renderTargetColorImage.image;
-			imageViewCI.format = format;
-			imageViewCI.subresourceRange.baseMipLevel = 0;
-			imageViewCI.subresourceRange.levelCount = 1;
-			imageViewCI.subresourceRange.baseArrayLayer = 0;
-			imageViewCI.subresourceRange.layerCount = 1;
-			imageViewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewCI, nullptr, &renderTargetColorImage.view));
-
-			VkSamplerCreateInfo samplerCI = {};
-			samplerCI.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-			samplerCI.magFilter = VK_FILTER_LINEAR;
-			samplerCI.minFilter = VK_FILTER_LINEAR;
-			samplerCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-			samplerCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.mipLodBias = 0.0f;
-			samplerCI.compareOp = VK_COMPARE_OP_NEVER;
-			samplerCI.minLod = 0.0f;
-			samplerCI.maxLod = 0.0f;
-			samplerCI.maxAnisotropy = 1.0f;
-			VK_CHECK_RESULT(vkCreateSampler(device, &samplerCI, nullptr, &renderTargetColorImage.sampler));
-
-			VkDescriptorImageInfo descriptorImageInfo{};
-			descriptorImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-			descriptorImageInfo.imageView = renderTargetColorImage.view;
-			descriptorImageInfo.sampler = renderTargetColorImage.sampler;
-
 			const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.postprocessing, 1);
 			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &renderTargetDescriptorSet));
-			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(renderTargetDescriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &descriptorImageInfo);
+			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(renderTargetDescriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &renderTargetColorImage.descriptor);
 			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
-		}
-		{
-			VkImageCreateInfo imageCI{};
-			imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-			imageCI.imageType = VK_IMAGE_TYPE_2D;
-			imageCI.format = depthFormat;
-			imageCI.extent = { width, height, 1 };
-			imageCI.mipLevels = 1;
-			imageCI.arrayLayers = 1;
-			imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
-			imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
-			imageCI.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-
-			VK_CHECK_RESULT(vkCreateImage(device, &imageCI, nullptr, &renderTargetDepthImage.image));
-			VkMemoryRequirements memReqs{};
-			vkGetImageMemoryRequirements(device, renderTargetDepthImage.image, &memReqs);
-
-			VkMemoryAllocateInfo memAllloc{};
-			memAllloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-			memAllloc.allocationSize = memReqs.size;
-			memAllloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-			VK_CHECK_RESULT(vkAllocateMemory(device, &memAllloc, nullptr, &renderTargetDepthImage.mem));
-			VK_CHECK_RESULT(vkBindImageMemory(device, renderTargetDepthImage.image, renderTargetDepthImage.mem, 0));
-
-			VkImageViewCreateInfo imageViewCI{};
-			imageViewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-			imageViewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-			imageViewCI.image = renderTargetDepthImage.image;
-			imageViewCI.format = depthFormat;
-			imageViewCI.subresourceRange.baseMipLevel = 0;
-			imageViewCI.subresourceRange.levelCount = 1;
-			imageViewCI.subresourceRange.baseArrayLayer = 0;
-			imageViewCI.subresourceRange.layerCount = 1;
-			imageViewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewCI, nullptr, &renderTargetDepthImage.view));
 		}
 	}
 
 	void updateUniformBuffers()
 	{
+		updateLightInfo();
+
 		shaderData.values.projection = camera.matrices.perspective;
 		shaderData.values.model = camera.matrices.view;
 		shaderData.values.viewPos = camera.viewPos;
 		memcpy(shaderData.buffer.mapped, &shaderData.values, sizeof(shaderData.values));
+
+		postprocessingData.values.enableToneMapping = static_cast<int>(enableToneMapping);
+		postprocessingData.values.enableVignette = static_cast<int>(enableVignette);
+		postprocessingData.values.enableGrain = static_cast<int>(enableGrain);
+		postprocessingData.values.enableChromaticAberration = static_cast<int>(enableChromaticAberration);
+		memcpy(postprocessingData.buffer.mapped, &postprocessingData.values, sizeof(postprocessingData.values));
 	}
 
 	void prepare()
 	{
-		VulkanExampleBase::prepare();
 		loadAssets();
-		prepareLightMatrix();
+		updateLightInfo();
 		prepareUniformBuffers();
 		setupDescriptors();
-		prepareResources();
-		prepareRenderPass();
-		prepareFrameBuffer();
-		prepareMainPipelines();
-		preparePostprocessingPipeline();
-		prepareFilterPipeline();
+		VulkanExampleBase::prepare();
+		/*
+		 * The following 'recreate' functions will be called in setupFrameBuffer() in prepare() and especially in windowResize() for correctly resize
+		 * 1) However, the descriptorPool is created in setupDescriptors() function and will be used in the following functions
+		 *	  Therefore, VulkanExampleBase::prepare() must be called after setupDescriptors()
+		 * 2) Also, the pipelineCache is created in VulkanExampleBase::prepare() which is required for creating pipelines
+		 *	  Therefore, VulkanExampleBase::prepare() must be called before recreateMainPipelines()
+		 */
+		recreateResources();
+		recreateRenderPass();
+		recreateFrameBuffer();
+		recreateMainPipelines();
+		recreatePostprocessingPipeline();
+		recreateFilterPipeline();
 		buildCommandBuffers();
+		timer.update();
 		prepared = true;
+	}
+
+	void fixedUpdate() {
+		if (animationPlay) {
+			animationTime += fixedUpdateDelta;
+			if (animationTime > glTFModel.animations[animationIndex].end) {
+				animationTime = 0.0f;
+			}
+			glTFModel.update(animationIndex, animationTime);
+		}
 	}
 
 	virtual void render()
 	{
 		renderFrame();
-		if (camera.updated) {
-			updateUniformBuffers();
+		updateUniformBuffers();
+		fixedUpdateTimer += static_cast<float>(timer.deltaTime());
+		timer.update();
+		if (fixedUpdateTimer > fixedUpdateDelta) {
+			fixedUpdateTimer -= fixedUpdateDelta;
+			fixedUpdate();
 		}
+	}
+
+	virtual void setupFrameBuffer() {
+		VulkanExampleBase::setupFrameBuffer();
+		recreateResources();
+		recreateRenderPass();
+		recreateFrameBuffer();
+		recreateMainPipelines();
+		recreatePostprocessingPipeline();
+		recreateFilterPipeline();
 	}
 
 	virtual void viewChanged()
@@ -1632,12 +1649,23 @@ public:
 		updateUniformBuffers();
 	}
 
-	virtual void OnUpdateUIOverlay(vks::UIOverlay *overlay)
+	virtual void OnUpdateUIOverlay(vks::UIOverlay* overlay)
 	{
 		if (overlay->header("Settings")) {
 			if (overlay->checkBox("Wireframe", &wireframe)) {
 				buildCommandBuffers();
 			}
+			overlay->comboBox("Animations", &animationIndex, animationNames);
+			overlay->checkBox("Play", &animationPlay);
+			overlay->sliderFloat("Time", &animationTime, glTFModel.animations[animationIndex].start, glTFModel.animations[animationIndex].end);
+			overlay->checkBox("ToneMapping", &enableToneMapping);
+			overlay->checkBox("Vignette", &enableVignette);
+			overlay->checkBox("Grain", &enableGrain);
+			overlay->checkBox("ChromaticAberration", &enableChromaticAberration);
+			overlay->sliderFloat("Light Intensity", &lightIntensity, 0.0f, 10.0f);
+			overlay->sliderFloat("Light Direction X", &lightDirection.x, -1.0f, 1.0f);
+			overlay->sliderFloat("Light Direction Y", &lightDirection.y, -1.0f, 1.0f);
+			overlay->sliderFloat("Light Direction Z", &lightDirection.z, -1.0f, 1.0f);
 		}
 	}
 };

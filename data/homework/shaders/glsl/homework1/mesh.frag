@@ -6,13 +6,20 @@ layout (set = 1, binding = 2) uniform sampler2D samplerMetallicRoughnessMap;
 layout (set = 1, binding = 3) uniform sampler2D samplerEmissiveMap;
 layout (set = 1, binding = 4) uniform sampler2D samplerOcclusionMap;
 
+layout (set = 1, binding = 5) uniform UBOMaterial
+{
+	vec4 baseColorFactor;
+	float roughnessFactor;
+	float metallicFactor;
+} uboMaterial;
+
 layout (set = 2, binding = 0) uniform sampler2D samplerShadowMap;
 
 layout (location = 0) in vec3 inNormal;
 layout (location = 1) in vec3 inColor;
 layout (location = 2) in vec2 inUV;
 layout (location = 3) in vec3 inViewVec;
-layout (location = 4) in vec3 inLightVec;
+layout (location = 4) in vec4 inLightVec;
 layout (location = 5) in vec3 inWorldPos;
 layout (location = 6) in vec4 inLightSpacePos;
 
@@ -116,7 +123,7 @@ float VarianceShadowMap() {
 
 void main() 
 {
-	vec4 baseColor = texture(samplerColorMap, inUV) * vec4(inColor, 1.0) * primitive.baseColorFactor;
+	vec4 baseColor = texture(samplerColorMap, inUV) * vec4(inColor, 1.0) * uboMaterial.baseColorFactor;
 	vec3 normal = texture(samplerNormalMap, inUV).rgb;
 	vec3 pbr = texture(samplerMetallicRoughnessMap, inUV).rgb;
 	vec3 emissive = texture(samplerEmissiveMap, inUV).rgb;
@@ -126,7 +133,7 @@ void main()
 	// Tangent Basis
 	mat3 TBN = GetOrthoBasis();
 	vec3 N = normalize(TBN * (normal * 2.0 - 1.0));
-	vec3 L = normalize(inLightVec);
+	vec3 L = normalize(inLightVec.xyz);
 	vec3 V = normalize(inViewVec);
 	vec3 H = normalize(L + V);
 
@@ -136,9 +143,9 @@ void main()
 	float LoH = clamp(dot(L, H), 0.0, 1.0);
 	float VoH = clamp(dot(V, H), 0.0, 1.0);
 
-	float perceptualRoughness = pbr.g * primitive.roughnessFactor;
+	float perceptualRoughness = pbr.g * uboMaterial.roughnessFactor;
 	float alphaRoughness = perceptualRoughness * perceptualRoughness;
-	float metallic = pbr.b * primitive.metallicFactor;
+	float metallic = pbr.b * uboMaterial.metallicFactor;
 
 	vec3 F0 = vec3(0.04);
 	vec3 diffuseColor = baseColor.rgb * (vec3(1.0) - F0) * (1.0 - metallic);
@@ -171,7 +178,11 @@ void main()
 	vec3 diffuse = (1.0 - F) * LambertianDiffuse(state);
 	vec3 specular = F * G * D / (4.0 * NoL * NoV);
 
-	vec3 color = (diffuse + specular) * occlusion * (1 - shadow) + emissive;
+	float lightIntensity = inLightVec.w;
+	vec3 color = (diffuse + specular) * lightIntensity * occlusion * (1 - shadow) + emissive;
+
+	const float ambientLight = 0.5;
+	color += (diffuse + specular) * ambientLight;
 
 	outFragColor = vec4(color, baseColor.a);
 }
