@@ -12,7 +12,8 @@ namespace hw1 {
 		VkDescriptorImageInfo descriptor{};
 	};
 
-	void createImage2D(vks::VulkanDevice const& device, Image2D* image, VkFormat format, VkExtent3D extent, VkImageUsageFlags usage, VkImageAspectFlags aspect);
+	void createImage2D(vks::VulkanDevice const& device, Image2D* image, VkFormat format, VkExtent3D extent, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+		VkFilter filter = VK_FILTER_LINEAR, VkSamplerAddressMode addressMode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
 
 	void destroyImage2D(VkDevice device, Image2D* image);
 

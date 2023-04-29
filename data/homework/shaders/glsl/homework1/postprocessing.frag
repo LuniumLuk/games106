@@ -18,6 +18,10 @@ const float vignetteFactor = 0.5;
 const float grainFactor = 0.01;
 const float chromaticAberrationFactor = 0.01;
 
+vec4 GammaCorrection(vec4 color) {
+	return vec4(pow(color.rgb, vec3(0.454545454545)), color.a);
+}
+
 vec3 Tonemap_ACES(const vec3 c) {
 	// Narkowicz 2015, "ACES Filmic Tone Mapping Curve"
 	// const float a = 2.51;
@@ -35,7 +39,7 @@ vec3 Tonemap_ACES(const vec3 c) {
 
 float Vignette() {
 	vec2 uv = inUV * 2.0 - 1.0;
-	float vignette = sqrt(uv.x * uv.x + uv.y * uv.y);
+	float vignette = sqrt(abs(uv.x * uv.x * uv.x) + abs(uv.y * uv.y * uv.y));
 	vignette = clamp(vignette, 0.0, 1.0);
 	return 1.0 - vignette * vignetteFactor;
 }
@@ -43,7 +47,7 @@ float Vignette() {
 vec3 Grain() {
 	vec2 uv = inUV * 2.0 - 1.0;
 	float grain = fract(sin(dot(uv.xy, vec2(12.9898, 78.233))) * 43758.5453);
-	return vec3(grain * grainFactor);
+	return vec3((grain - 0.5) * grainFactor);
 }
 
 vec3 ChromaticAberration() {
@@ -70,6 +74,8 @@ void main() {
 	if (uboParameter.enableToneMapping == 1) color = Tonemap_ACES(color);
 	if (uboParameter.enableVignette == 1) color *= Vignette();
 	if (uboParameter.enableGrain == 1) color += Grain();
-	outFragColor = vec4(color, 1.0);
+
+	color = clamp(color, vec3(0.0), vec3(1.0));
+	outFragColor = GammaCorrection(vec4(color, 1.0));
 }
 

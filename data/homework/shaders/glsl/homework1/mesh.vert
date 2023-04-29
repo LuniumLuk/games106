@@ -15,14 +15,8 @@ layout (set = 0, binding = 0) uniform UBOScene
 	vec4 viewPos;
 	mat4 lightMatrix;
 	float lightIntensity;
+	float ambientIntensity;
 } uboScene;
-
-layout(push_constant) uniform PushConsts {
-	mat4 model;
-	vec4 baseColorFactor;
-	float roughnessFactor;
-	float metallicFactor;
-} primitive;
 
 #define MAX_NUM_JOINTS 32
 
@@ -38,7 +32,7 @@ layout (location = 0) out vec3 outNormal;
 layout (location = 1) out vec3 outColor;
 layout (location = 2) out vec2 outUV;
 layout (location = 3) out vec3 outViewVec;
-layout (location = 4) out vec4 outLightVec;
+layout (location = 4) out vec3 outLightVec;
 layout (location = 5) out vec3 outWorldPos;
 layout (location = 6) out vec4 outLightSpacePos;
 
@@ -65,7 +59,7 @@ void main()
 		outNormal = mat3(uboAnimation.matrixInverseTransposed) * inverse(transpose(mat3(skinningMatrix))) * inNormal;
 	}
 
-	outLightVec = vec4(uboScene.lightDir.xyz, uboScene.lightIntensity);
+	outLightVec = uboScene.lightDir.xyz;
 	outViewVec = uboScene.viewPos.xyz - pos.xyz;
 	outWorldPos = pos.xyz;
 	outLightSpacePos = uboScene.lightMatrix * pos;

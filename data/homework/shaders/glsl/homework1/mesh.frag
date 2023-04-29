@@ -1,5 +1,16 @@
 #version 450
 
+layout (set = 0, binding = 0) uniform UBOScene
+{
+	mat4 projection;
+	mat4 view;
+	vec4 lightDir;
+	vec4 viewPos;
+	mat4 lightMatrix;
+	float lightIntensity;
+	float ambientIntensity;
+} uboScene;
+
 layout (set = 1, binding = 0) uniform sampler2D samplerColorMap;
 layout (set = 1, binding = 1) uniform sampler2D samplerNormalMap;
 layout (set = 1, binding = 2) uniform sampler2D samplerMetallicRoughnessMap;
@@ -19,7 +30,7 @@ layout (location = 0) in vec3 inNormal;
 layout (location = 1) in vec3 inColor;
 layout (location = 2) in vec2 inUV;
 layout (location = 3) in vec3 inViewVec;
-layout (location = 4) in vec4 inLightVec;
+layout (location = 4) in vec3 inLightVec;
 layout (location = 5) in vec3 inWorldPos;
 layout (location = 6) in vec4 inLightSpacePos;
 
@@ -32,21 +43,25 @@ layout(push_constant) uniform PushConsts {
 	float metallicFactor;
 } primitive;
 
-#define PI 3.14159265359
+#define PI 				3.141592653590
+
+vec4 GammaTransform(vec4 color) {
+	return vec4(pow(color.rgb, vec3(2.2)), color.a);
+}
 
 struct PBRState {
-	float NoL;						// cos angle between normal and light direction
-	float NoV;						// cos angle between normal and view direction
-	float NoH;						// cos angle between normal and half vector
-	float LoH;						// cos angle between light direction and half vector
-	float VoH;						// cos angle between view direction and half vector
-	float alphaRoughness;			// roughness mapped to a more linear change in the roughness (proposed by [2])
-	float perceptualRoughness;		// roughness value, as authored by the model creator (input to shader)
-	float metallic;					// metallic value at the surface
-	vec3 R0;						// full reflectance color (normal incidence angle)
-	vec3 R90;						// reflectance color at grazing angle
-	vec3 diffuseColor;				// color contribution from diffuse lighting
-	vec3 specularColor;				// color contribution from specular lighting
+	float NoL;						// Cos angle between normal and light direction
+	float NoV;						// Cos angle between normal and view direction
+	float NoH;						// Cos angle between normal and half vector
+	float LoH;						// Cos angle between light direction and half vector
+	float VoH;						// Cos angle between view direction and half vector
+	float alphaRoughness;			// Roughness value remapped linearly
+	float perceptualRoughness;		// Roughness value originally
+	float metallic;					// Metallic value
+	vec3 R0;						// Reflectance color at normal incident angle
+	vec3 R90;						// Reflectance color at grazing angle
+	vec3 diffuseColor;				// Color contribution from diffuse lighting
+	vec3 specularColor;				// Color contribution from specular lighting
 };
 
 float sqr(float x) {
@@ -123,7 +138,7 @@ float VarianceShadowMap() {
 
 void main() 
 {
-	vec4 baseColor = texture(samplerColorMap, inUV) * vec4(inColor, 1.0) * uboMaterial.baseColorFactor;
+	vec4 baseColor = GammaTransform(texture(samplerColorMap, inUV)) * vec4(inColor, 1.0) * uboMaterial.baseColorFactor;
 	vec3 normal = texture(samplerNormalMap, inUV).rgb;
 	vec3 pbr = texture(samplerMetallicRoughnessMap, inUV).rgb;
 	vec3 emissive = texture(samplerEmissiveMap, inUV).rgb;
@@ -133,7 +148,7 @@ void main()
 	// Tangent Basis
 	mat3 TBN = GetOrthoBasis();
 	vec3 N = normalize(TBN * (normal * 2.0 - 1.0));
-	vec3 L = normalize(inLightVec.xyz);
+	vec3 L = normalize(inLightVec);
 	vec3 V = normalize(inViewVec);
 	vec3 H = normalize(L + V);
 
@@ -143,6 +158,7 @@ void main()
 	float LoH = clamp(dot(L, H), 0.0, 1.0);
 	float VoH = clamp(dot(V, H), 0.0, 1.0);
 
+	// PBR Parameters
 	float perceptualRoughness = pbr.g * uboMaterial.roughnessFactor;
 	float alphaRoughness = perceptualRoughness * perceptualRoughness;
 	float metallic = pbr.b * uboMaterial.metallicFactor;
@@ -171,18 +187,20 @@ void main()
 		specularColor
 	);
 
+	// BRDFs
 	vec3 F = SpecularFresnel(state);
 	float G = GeometricOcclusion(state);
 	float D = MicrofacetDistribution(state);
 
+	// Diffuse and Specular components
 	vec3 diffuse = (1.0 - F) * LambertianDiffuse(state);
 	vec3 specular = F * G * D / (4.0 * NoL * NoV);
 
-	float lightIntensity = inLightVec.w;
+	// Apply lighting (directional + ambient)
+	float lightIntensity = uboScene.lightIntensity;
 	vec3 color = (diffuse + specular) * lightIntensity * occlusion * (1 - shadow) + emissive;
+	color += (diffuse + specular) * uboScene.ambientIntensity;
 
-	const float ambientLight = 0.5;
-	color += (diffuse + specular) * ambientLight;
-
+	// Output color in linear space
 	outFragColor = vec4(color, baseColor.a);
 }

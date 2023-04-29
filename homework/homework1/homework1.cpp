@@ -17,15 +17,24 @@
  * If you are looking for a complete glTF implementation, check out https://github.com/SaschaWillems/Vulkan-glTF-PBR/
  */
 
-// [TODO] Add Skeleton Animation Support
-
 /*
- * The RenderPasses are as follow:
+ * Games106 Homework 1
+ * - By Ziyi.Lu
  * 
- * Pass #1: Shadow Pass: (Render variance shadow map)
- * Pass #2: Filter Pass: (Filter variance shadow map)
- * Pass #3: Main Pass: (Render model with lighting and shadow)
- * Pass #4: Postprocessing Pass: (Postprocessing and present)
+ * I implemented the following features:
+ *	1. Skeleton animation
+ *	2. PBR material
+ *		including: normal/roughness/metallic/emission/occlusion map
+ *	3. Postprocessing
+ *		includeing: tone mapping, vignette, grain and chromatic aberration
+ *	4. Variance shadow map (for directional light)
+ * 
+ * It took four render passes to composite the final image:
+ * 
+ *	Pass #1: Shadow Pass: (Render variance shadow map)
+ *	Pass #2: Filter Pass: (Filter variance shadow map)
+ *	Pass #3: Main Pass: (Render model with lighting and shadow)
+ *	Pass #4: Postprocessing Pass: (Postprocessing and present)
  * 
  */
 
@@ -202,14 +211,6 @@ public:
 		std::vector<AnimationChannel> channels;
 		float start = std::numeric_limits<float>::max();
 		float end = std::numeric_limits<float>::min();
-	};
-
-	// [TODO] Actually, we need not to use pushconstant so far
-	struct PushConstant {
-		glm::mat4 model;
-		glm::vec4 baseColorFactor;
-		float roughnessFactor;
-		float metallicFactor;
 	};
 
 	// A glTF material stores information in e.g. the texture that is attached to it and colors
@@ -763,15 +764,6 @@ public:
 
 			for (VulkanglTFModel::Primitive& primitive : node->mesh.primitives) {
 				if (primitive.indexCount > 0) {
-					PushConstant push{};
-					push.model = nodeMatrix;
-					// Pass material properties via push constants
-					push.baseColorFactor = materials[primitive.materialIndex].shaderData.values.baseColorFactor;
-					push.roughnessFactor = materials[primitive.materialIndex].shaderData.values.roughnessFactor;
-					push.metallicFactor = materials[primitive.materialIndex].shaderData.values.metallicFactor;
-					// Pass the final matrix to the vertex shader using push constants
-					vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstant), &push);
-
 					auto const& mat = materials[primitive.materialIndex];
 					// Bind the descriptor for the current primitive's texture
 					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 1, 1, &materials[primitive.materialIndex].descriptorSet, 0, nullptr);
@@ -815,6 +807,7 @@ public:
 	bool enableGrain = true;
 	bool enableChromaticAberration = true;
 	float lightIntensity = 5.0f;
+	float ambientIntensity = 1.0f;
 	glm::vec3 lightDirection = glm::vec3(0.25f, 1.0f, 0.25f);
 
 	VulkanglTFModel glTFModel;
@@ -829,6 +822,7 @@ public:
 			glm::vec4 viewPos;
 			glm::mat4 lightMatrix;
 			float lightIntensity;
+			float ambientIntensity;
 		} values;
 	} shaderData;
 
@@ -1227,7 +1221,7 @@ public:
 		VK_CHECK_RESULT(vkCreateDescriptorPool(device, &descriptorPoolInfo, nullptr, &descriptorPool));
 
 		// Descriptor set layout for passing matrices
-		VkDescriptorSetLayoutBinding setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
+		VkDescriptorSetLayoutBinding setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0);
 		VkDescriptorSetLayoutCreateInfo descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(&setLayoutBinding, 1);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.matrices));
 		// Descriptor set layout for passing material textures
@@ -1262,11 +1256,6 @@ public:
 			descriptorSetLayouts.animation
 		};
 		VkPipelineLayoutCreateInfo pipelineLayoutCI = vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(), static_cast<uint32_t>(setLayouts.size()));
-		// We will use push constants to push the local matrices of a primitive to the vertex shader
-		VkPushConstantRange pushConstantRange = vks::initializers::pushConstantRange(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(VulkanglTFModel::PushConstant), 0);
-		// Push constant ranges are part of the pipeline layout
-		pipelineLayoutCI.pushConstantRangeCount = 1;
-		pipelineLayoutCI.pPushConstantRanges = &pushConstantRange;
 		VK_CHECK_RESULT(vkCreatePipelineLayout(device, &pipelineLayoutCI, nullptr, &pipelineLayouts.main));
 		setLayouts = {
 			descriptorSetLayouts.postprocessing,
@@ -1354,6 +1343,7 @@ public:
 		shaderData.values.lightMatrix = proj * view;
 		shaderData.values.lightDir = glm::vec4(lightDir, 0.0);
 		shaderData.values.lightIntensity = lightIntensity;
+		shaderData.values.ambientIntensity = ambientIntensity;
 	}
 
 	void recreateMainPipelines()
@@ -1525,7 +1515,8 @@ public:
 		updateUniformBuffers();
 	}
 
-	void recreateResources() {
+	void recreateResources()
+	{
 		hw1::destroyImage2D(device, &shadowMapColorImage);
 		hw1::destroyImage2D(device, &shadowMapDepthImage);
 		hw1::destroyImage2D(device, &shadowMapFilteredImage);
@@ -1612,7 +1603,8 @@ public:
 		prepared = true;
 	}
 
-	void fixedUpdate() {
+	void fixedUpdate()
+	{
 		if (animationPlay) {
 			animationTime += fixedUpdateDelta;
 			if (animationTime > glTFModel.animations[animationIndex].end) {
@@ -1634,7 +1626,8 @@ public:
 		}
 	}
 
-	virtual void setupFrameBuffer() {
+	virtual void setupFrameBuffer()
+	{
 		VulkanExampleBase::setupFrameBuffer();
 		recreateResources();
 		recreateRenderPass();
@@ -1655,17 +1648,24 @@ public:
 			if (overlay->checkBox("Wireframe", &wireframe)) {
 				buildCommandBuffers();
 			}
-			overlay->comboBox("Animations", &animationIndex, animationNames);
-			overlay->checkBox("Play", &animationPlay);
-			overlay->sliderFloat("Time", &animationTime, glTFModel.animations[animationIndex].start, glTFModel.animations[animationIndex].end);
-			overlay->checkBox("ToneMapping", &enableToneMapping);
-			overlay->checkBox("Vignette", &enableVignette);
-			overlay->checkBox("Grain", &enableGrain);
-			overlay->checkBox("ChromaticAberration", &enableChromaticAberration);
-			overlay->sliderFloat("Light Intensity", &lightIntensity, 0.0f, 10.0f);
-			overlay->sliderFloat("Light Direction X", &lightDirection.x, -1.0f, 1.0f);
-			overlay->sliderFloat("Light Direction Y", &lightDirection.y, -1.0f, 1.0f);
-			overlay->sliderFloat("Light Direction Z", &lightDirection.z, -1.0f, 1.0f);
+			if (overlay->header("Animation")) {
+				overlay->comboBox("Animations", &animationIndex, animationNames);
+				overlay->checkBox("Play", &animationPlay);
+				overlay->sliderFloat("Time", &animationTime, glTFModel.animations[animationIndex].start, glTFModel.animations[animationIndex].end);
+			}
+			if (overlay->header("Postprocessing")) {
+				overlay->checkBox("ToneMapping", &enableToneMapping);
+				overlay->checkBox("Vignette", &enableVignette);
+				overlay->checkBox("Grain", &enableGrain);
+				overlay->checkBox("ChromaticAberration", &enableChromaticAberration);
+			}
+			if (overlay->header("Lighting")) {
+				overlay->sliderFloat("Light Intensity", &lightIntensity, 0.0f, 10.0f);
+				overlay->sliderFloat("Light Direction X", &lightDirection.x, -1.0f, 1.0f);
+				overlay->sliderFloat("Light Direction Y", &lightDirection.y, -1.0f, 1.0f);
+				overlay->sliderFloat("Light Direction Z", &lightDirection.z, -1.0f, 1.0f);
+				overlay->sliderFloat("Ambient Intensity", &ambientIntensity, 0.0f, 10.0f);
+			}
 		}
 	}
 };

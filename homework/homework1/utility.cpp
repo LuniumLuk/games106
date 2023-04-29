@@ -2,7 +2,7 @@
 
 namespace hw1 {
 
-	void createImage2D(vks::VulkanDevice const& device, Image2D* image, VkFormat format, VkExtent3D extent, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+	void createImage2D(vks::VulkanDevice const& device, Image2D* image, VkFormat format, VkExtent3D extent, VkImageUsageFlags usage, VkImageAspectFlags aspect, VkFilter filter, VkSamplerAddressMode addressMode) {
 		VkImageCreateInfo imageCI{};
 		imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 		imageCI.imageType = VK_IMAGE_TYPE_2D;
@@ -40,12 +40,12 @@ namespace hw1 {
 		if (usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
 			VkSamplerCreateInfo samplerCI = {};
 			samplerCI.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-			samplerCI.magFilter = VK_FILTER_LINEAR;
-			samplerCI.minFilter = VK_FILTER_LINEAR;
+			samplerCI.magFilter = filter;
+			samplerCI.minFilter = filter;
 			samplerCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-			samplerCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			samplerCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+			samplerCI.addressModeU = addressMode;
+			samplerCI.addressModeV = addressMode;
+			samplerCI.addressModeW = addressMode;
 			samplerCI.mipLodBias = 0.0f;
 			samplerCI.compareOp = VK_COMPARE_OP_NEVER;
 			samplerCI.minLod = 0.0f;
