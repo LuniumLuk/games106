@@ -36,5 +36,19 @@ layout (set = 3, binding = 0) uniform UBOAnimation
 
 void main() 
 {
-	gl_Position = uboScene.lightMatrix * uboAnimation.matrix * vec4(inPos.xyz, 1.0);
+	vec4 pos;
+	if (uboAnimation.jointCount == 0) {
+		pos = uboAnimation.matrix * vec4(inPos, 1.0);
+	}
+	else {
+		mat4 skinningMatrix =
+			inWeight.x * uboAnimation.jointMatrices[min(int(inJoint.x), MAX_NUM_JOINTS)] +
+			inWeight.y * uboAnimation.jointMatrices[min(int(inJoint.y), MAX_NUM_JOINTS)] +
+			inWeight.z * uboAnimation.jointMatrices[min(int(inJoint.z), MAX_NUM_JOINTS)] +
+			inWeight.w * uboAnimation.jointMatrices[min(int(inJoint.w), MAX_NUM_JOINTS)];
+		
+		pos = uboAnimation.matrix * skinningMatrix * vec4(inPos, 1.0);
+	}
+
+	gl_Position = uboScene.lightMatrix * pos;
 }

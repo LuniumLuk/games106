@@ -41,8 +41,7 @@ void main()
 	outNormal = inNormal;
 	outColor = inColor;
 	outUV = inUV;
-	gl_Position = uboScene.projection * uboScene.view * uboAnimation.matrix * vec4(inPos.xyz, 1.0);
-	
+
 	vec4 pos;
 	if (uboAnimation.jointCount == 0) {
 		pos = uboAnimation.matrix * vec4(inPos, 1.0);
@@ -59,6 +58,7 @@ void main()
 		outNormal = mat3(uboAnimation.matrixInverseTransposed) * inverse(transpose(mat3(skinningMatrix))) * inNormal;
 	}
 
+	gl_Position = uboScene.projection * uboScene.view * pos;
 	outLightVec = uboScene.lightDir.xyz;
 	outViewVec = uboScene.viewPos.xyz - pos.xyz;
 	outWorldPos = pos.xyz;

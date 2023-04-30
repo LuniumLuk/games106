@@ -36,6 +36,7 @@
  *	Pass #3: Main Pass: (Render model with lighting and shadow)
  *	Pass #4: Postprocessing Pass: (Postprocessing and present)
  * 
+ * To change the loaded model, goto [line 1204]
  */
 
 #define TINYGLTF_IMPLEMENTATION
@@ -515,6 +516,7 @@ public:
 		VulkanglTFModel::Node* node = new VulkanglTFModel::Node{};
 		node->matrix = glm::mat4(1.0f);
 		node->parent = parent;
+		node->skinIndex = inputNode.skin;
 
 		// Setup uniform buffer for animation
 		VK_CHECK_RESULT(vulkanDevice->createBuffer(
@@ -1200,6 +1202,7 @@ public:
 	void loadAssets()
 	{
 		loadglTFFile(getAssetPath() + "buster_drone/busterDrone.gltf");
+		//loadglTFFile(getAssetPath() + "models/CesiumMan/glTF/CesiumMan.gltf");
 	}
 
 	void setupDescriptors()
