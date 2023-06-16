@@ -21,16 +21,16 @@ namespace hw1 {
 
 	void createFrameBuffer(VkDevice device, VkFramebuffer* frameBuffer, VkExtent2D extent, VkRenderPass renderPass, VkImageView colorView, VkImageView depthView = VK_NULL_HANDLE);
 
-    struct Timer {
-        Timer();
-        void update() noexcept;
-        double deltaTime() noexcept;
+	struct Timer {
+		Timer();
+		void update() noexcept;
+		double deltaTime() noexcept;
 		double totalTime() noexcept;
 
-    private:
-        std::chrono::steady_clock::time_point startTimePoint;
-        std::chrono::steady_clock::time_point prevTimePoint;
-        double delta = 0.0;
-    };
+	private:
+		std::chrono::steady_clock::time_point startTimePoint;
+		std::chrono::steady_clock::time_point prevTimePoint;
+		double delta = 0.0;
+	};
 
 } // namespace hw1

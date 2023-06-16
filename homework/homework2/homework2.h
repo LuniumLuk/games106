@@ -9,18 +9,14 @@
 #include "vulkanexamplebase.h"
 #include "VulkanglTFModel.h"
 
-#define ENABLE_VALIDATION false
+#define ENABLE_VALIDATION true
 
 class VulkanExample : public VulkanExampleBase
 {
 public:
 	vkglTF::Model scene;
 
-	struct ShadingRateImage {
-		VkImage image;
-		VkDeviceMemory memory;
-		VkImageView view;
-	} shadingRateImage;
+	vks::Texture2D shadingRateImage;
 
 	bool enableShadingRate = true;
 	bool colorShadingRate = false;
@@ -42,12 +38,39 @@ public:
 		VkPipeline masked;
 	};
 
-	Pipelines basePipelines;
-	Pipelines shadingRatePipelines;
+	struct {
+		Pipelines basePipelines;
+		Pipelines shadingRatePipelines;
+		VkSemaphore semaphore;
+		VkPipelineLayout pipelineLayout;
+		VkDescriptorSet descriptorSet;
+		VkDescriptorSetLayout descriptorSetLayout;
+		VkRenderPass renderPass;
+		struct {
+			VkFramebuffer frameBuffer;
+			vks::Texture2D colorImage;
+			vks::Texture2D depthImage;
+		} frameBuffer;
+	} main;
 
-	VkPipelineLayout pipelineLayout;
-	VkDescriptorSet descriptorSet;
-	VkDescriptorSetLayout descriptorSetLayout;
+	struct {
+		VkPipeline pipeline;
+		VkPipelineLayout pipelineLayout;
+		VkDescriptorSet descriptorSet;
+		VkDescriptorSetLayout descriptorSetLayout;
+		VkRenderPass renderPass;
+	} present;
+
+	struct {
+		VkQueue queue;
+		VkCommandPool commandPool;
+		VkCommandBuffer commandBuffer;
+		VkSemaphore semaphore;
+		VkDescriptorSetLayout descriptorSetLayout;
+		VkDescriptorSet descriptorSet;
+		VkPipelineLayout pipelineLayout;
+		VkPipeline pipeline;
+	} compute;
 
 	VkPhysicalDeviceShadingRateImagePropertiesNV physicalDeviceShadingRateImagePropertiesNV{};
 	VkPhysicalDeviceShadingRateImageFeaturesNV enabledPhysicalDeviceShadingRateImageFeaturesNV{};
@@ -57,15 +80,21 @@ public:
 	~VulkanExample();
 	virtual void getEnabledFeatures();
 	void handleResize();
+	void buildComputeCommandBuffer();
 	void buildCommandBuffers();
 	void loadglTFFile(std::string filename);
 	void loadAssets();
 	void prepareShadingRateImage();
 	void setupDescriptors();
 	void preparePipelines();
+	void prepareGraphics();
+	void prepareCompute();
+	void prepareMainRenderPass();
+	void preparePresentRenderPass();
 	void prepareUniformBuffers();
 	void updateUniformBuffers();
 	void prepare();
+	virtual void renderFrame();
 	virtual void render();
 	virtual void OnUpdateUIOverlay(vks::UIOverlay* overlay);
 };

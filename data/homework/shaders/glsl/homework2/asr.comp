@@ -1,0 +1,13 @@
+#version 450
+
+layout (local_size_x = 16, local_size_y = 16) in;
+layout (binding = 0, rgba8) uniform readonly image2D u_input;
+layout (binding = 1, r8ui) uniform uimage2D u_output;
+
+void main() {
+	uvec4 ret = uvec4(8, 0, 0, 255);
+
+	if (gl_LocalInvocationID.x == 0 && gl_LocalInvocationID.y == 0) {
+		imageStore(u_output, ivec2(gl_WorkGroupID.xy), ret);
+	}
+}
