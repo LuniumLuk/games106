@@ -23,6 +23,7 @@ layout (set = 0, binding = 0) uniform UBOScene
 } uboScene;
 
 layout (location = 0) out vec4 outFragColor;
+layout (location = 1) out vec4 outShadingRateVisualize;
 
 layout (constant_id = 0) const bool ALPHA_MASK = false;
 layout (constant_id = 1) const float ALPHA_MASK_CUTOFF = 0.0f;
@@ -53,32 +54,33 @@ void main()
 
 	if (uboScene.colorShadingRates == 1) {
 		if (gl_FragmentSizeNV.x == 1 && gl_FragmentSizeNV.y == 1) {
-			outFragColor.rgb *= vec3(0.0, 0.8, 0.4);
+			outShadingRateVisualize.rgb = vec3(0.0, 0.8, 0.4);
 			return;
 		}
 		if (gl_FragmentSizeNV.x == 2 && gl_FragmentSizeNV.y == 1) {
-			outFragColor.rgb *= vec3(0.2, 0.6, 1.0);
+			outShadingRateVisualize.rgb = vec3(0.2, 0.6, 1.0);
 			return;
 		}
 		if (gl_FragmentSizeNV.x == 1 && gl_FragmentSizeNV.y == 2) {
-			outFragColor.rgb *= vec3(0.0, 0.4, 0.8);
+			outShadingRateVisualize.rgb = vec3(0.0, 0.4, 0.8);
 			return;
 		}
 		if (gl_FragmentSizeNV.x == 2 && gl_FragmentSizeNV.y == 2) {
-			outFragColor.rgb *= vec3(1.0, 1.0, 0.2);
+			outShadingRateVisualize.rgb = vec3(1.0, 1.0, 0.2);
 			return;
 		}
 		if (gl_FragmentSizeNV.x == 4 && gl_FragmentSizeNV.y == 2) {
-			outFragColor.rgb *= vec3(0.8, 0.8, 0.0);
+			outShadingRateVisualize.rgb = vec3(0.8, 0.8, 0.0);
 			return;
 		}
 		if (gl_FragmentSizeNV.x == 2 && gl_FragmentSizeNV.y == 4) {
-			outFragColor.rgb *= vec3(1.0, 0.4, 0.2);
+			outShadingRateVisualize.rgb = vec3(1.0, 0.4, 0.2);
 			return;
 		}
 		if (gl_FragmentSizeNV.x == 4 && gl_FragmentSizeNV.y == 4) {
-			outFragColor.rgb *= vec3(0.8, 0.0, 0.0);
+			outShadingRateVisualize.rgb = vec3(0.8, 0.0, 0.0);
 			return;
 		}
 	}
+	outShadingRateVisualize.rgb = vec3(1.0);
 }

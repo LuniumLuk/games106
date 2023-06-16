@@ -50,6 +50,7 @@ public:
 			VkFramebuffer frameBuffer;
 			vks::Texture2D colorImage;
 			vks::Texture2D depthImage;
+			vks::Texture2D shadingRateVisualizeImage;
 		} frameBuffer;
 	} main;
 
@@ -74,6 +75,7 @@ public:
 
 	VkPhysicalDeviceShadingRateImagePropertiesNV physicalDeviceShadingRateImagePropertiesNV{};
 	VkPhysicalDeviceShadingRateImageFeaturesNV enabledPhysicalDeviceShadingRateImageFeaturesNV{};
+	VkPhysicalDeviceShaderAtomicFloatFeaturesEXT floatFeatures{};
 	PFN_vkCmdBindShadingRateImageNV vkCmdBindShadingRateImageNV;
 
 	VulkanExample();
