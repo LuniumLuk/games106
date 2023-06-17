@@ -21,7 +21,7 @@ public:
 	bool enableShadingRate = true;
 	bool colorShadingRate = false;
 
-	struct ShaderData {
+	struct SceneUBO {
 		vks::Buffer buffer;
 		struct Values {
 			glm::mat4 projection;
@@ -31,7 +31,20 @@ public:
 			glm::vec4 viewPos;
 			int32_t colorShadingRate;
 		} values;
-	} shaderData;
+	} sceneUBO;
+
+	glm::mat4 previousProjView = glm::mat4(1.0f);
+	int mode = 0;
+	float sensitivity = 0.1f;
+
+	struct ComputeUBO {
+		vks::Buffer buffer;
+		struct Values {
+			glm::mat4 reprojection;
+			int mode;
+			float sensitivity;
+		} values;
+	} computeUBO;
 
 	struct Pipelines {
 		VkPipeline opaque;
@@ -71,6 +84,7 @@ public:
 		VkDescriptorSet descriptorSet;
 		VkPipelineLayout pipelineLayout;
 		VkPipeline pipeline;
+		vks::Texture2D errorHistoryImage;
 	} compute;
 
 	VkPhysicalDeviceShadingRateImagePropertiesNV physicalDeviceShadingRateImagePropertiesNV{};

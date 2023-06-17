@@ -53,34 +53,9 @@ void main()
 	outFragColor = vec4(diffuse * color.rgb + specular, color.a);
 
 	if (uboScene.colorShadingRates == 1) {
-		if (gl_FragmentSizeNV.x == 1 && gl_FragmentSizeNV.y == 1) {
-			outShadingRateVisualize.rgb = vec3(0.0, 0.8, 0.4);
-			return;
-		}
-		if (gl_FragmentSizeNV.x == 2 && gl_FragmentSizeNV.y == 1) {
-			outShadingRateVisualize.rgb = vec3(0.2, 0.6, 1.0);
-			return;
-		}
-		if (gl_FragmentSizeNV.x == 1 && gl_FragmentSizeNV.y == 2) {
-			outShadingRateVisualize.rgb = vec3(0.0, 0.4, 0.8);
-			return;
-		}
-		if (gl_FragmentSizeNV.x == 2 && gl_FragmentSizeNV.y == 2) {
-			outShadingRateVisualize.rgb = vec3(1.0, 1.0, 0.2);
-			return;
-		}
-		if (gl_FragmentSizeNV.x == 4 && gl_FragmentSizeNV.y == 2) {
-			outShadingRateVisualize.rgb = vec3(0.8, 0.8, 0.0);
-			return;
-		}
-		if (gl_FragmentSizeNV.x == 2 && gl_FragmentSizeNV.y == 4) {
-			outShadingRateVisualize.rgb = vec3(1.0, 0.4, 0.2);
-			return;
-		}
-		if (gl_FragmentSizeNV.x == 4 && gl_FragmentSizeNV.y == 4) {
-			outShadingRateVisualize.rgb = vec3(0.8, 0.0, 0.0);
-			return;
-		}
+		outShadingRateVisualize = vec4(float(gl_FragmentSizeNV.x), float(gl_FragmentSizeNV.y), gl_FragCoord.z, 1.0);
+		return;
 	}
-	outShadingRateVisualize.rgb = vec3(1.0);
+
+	outShadingRateVisualize = vec4(0.0, 0.0, gl_FragCoord.z, 1.0);
 }

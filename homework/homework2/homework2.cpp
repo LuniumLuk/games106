@@ -49,8 +49,10 @@ VulkanExample::~VulkanExample()
 	main.frameBuffer.colorImage.destroy();
 	main.frameBuffer.depthImage.destroy();
 	main.frameBuffer.shadingRateVisualizeImage.destroy();
+	compute.errorHistoryImage.destroy();
 	shadingRateImage.destroy();
-	shaderData.buffer.destroy();
+	sceneUBO.buffer.destroy();
+	computeUBO.buffer.destroy();
 }
 
 void VulkanExample::getEnabledFeatures()
@@ -168,6 +170,9 @@ void VulkanExample::buildCommandBuffers()
 			imageMemoryBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			imageMemoryBarrier.image = main.frameBuffer.colorImage.image;
 			vkCmdPipelineBarrier(drawCmdBuffers[i], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
+			imageMemoryBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			imageMemoryBarrier.image = main.frameBuffer.shadingRateVisualizeImage.image;
+			vkCmdPipelineBarrier(drawCmdBuffers[i], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
 		}
 
 		VK_CHECK_RESULT(vkEndCommandBuffer(drawCmdBuffers[i]));
@@ -184,9 +189,9 @@ void VulkanExample::setupDescriptors()
 {
 	// Pool
 	const std::vector<VkDescriptorPoolSize> poolSizes = {
-		vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1),
+		vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2),
 		vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2),
-		vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2),
+		vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4),
 	};
 	VkDescriptorPoolCreateInfo descriptorPoolInfo = vks::initializers::descriptorPoolCreateInfo(poolSizes, 3);
 	VK_CHECK_RESULT(vkCreateDescriptorPool(device, &descriptorPoolInfo, nullptr, &descriptorPool));
@@ -210,7 +215,7 @@ void VulkanExample::setupDescriptors()
 	VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &main.descriptorSetLayout, 1);
 	VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &main.descriptorSet));
 	std::vector<VkWriteDescriptorSet> writeDescriptorSets = {
-		vks::initializers::writeDescriptorSet(main.descriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &shaderData.buffer.descriptor),
+		vks::initializers::writeDescriptorSet(main.descriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &sceneUBO.buffer.descriptor),
 	};
 	vkUpdateDescriptorSets(device, static_cast<uint32_t>(writeDescriptorSets.size()), writeDescriptorSets.data(), 0, nullptr);
 }
@@ -225,166 +230,229 @@ void VulkanExample::prepareShadingRateImage()
 	imageExtent.height = static_cast<uint32_t>(ceil(height / (float)physicalDeviceShadingRateImagePropertiesNV.shadingRateTexelSize.height));
 	imageExtent.depth = 1;
 
-	shadingRateImage.width = imageExtent.width;
-	shadingRateImage.height = imageExtent.height;
+	{
+		shadingRateImage.width = imageExtent.width;
+		shadingRateImage.height = imageExtent.height;
 
-	VkImageCreateInfo imageCI{};
-	imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-	imageCI.imageType = VK_IMAGE_TYPE_2D;
-	imageCI.format = VK_FORMAT_R8_UINT;
-	imageCI.extent = imageExtent;
-	imageCI.mipLevels = 1;
-	imageCI.arrayLayers = 1;
-	imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
-	imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
-	imageCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	imageCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	// this image will also be used as storage target in the compute shader
-	imageCI.usage = VK_IMAGE_USAGE_SHADING_RATE_IMAGE_BIT_NV | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+		VkImageCreateInfo imageCI{};
+		imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageCI.imageType = VK_IMAGE_TYPE_2D;
+		imageCI.format = VK_FORMAT_R8_UINT;
+		imageCI.extent = imageExtent;
+		imageCI.mipLevels = 1;
+		imageCI.arrayLayers = 1;
+		imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		imageCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		// this image will also be used as storage target in the compute shader
+		imageCI.usage = VK_IMAGE_USAGE_SHADING_RATE_IMAGE_BIT_NV | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
 
-	// If compute and graphics queue family indices differ, we create an image that can be shared between them
-	// This can result in worse performance than exclusive sharing mode, but save some synchronization to keep the sample simple
-	std::vector<uint32_t> queueFamilyIndices;
-	if (vulkanDevice->queueFamilyIndices.graphics != vulkanDevice->queueFamilyIndices.compute) {
-		queueFamilyIndices = {
-			vulkanDevice->queueFamilyIndices.graphics,
-			vulkanDevice->queueFamilyIndices.compute
-		};
-		imageCI.sharingMode = VK_SHARING_MODE_CONCURRENT;
-		imageCI.queueFamilyIndexCount = 2;
-		imageCI.pQueueFamilyIndices = queueFamilyIndices.data();
-	}
-
-	VK_CHECK_RESULT(vkCreateImage(device, &imageCI, nullptr, &shadingRateImage.image));
-	VkMemoryRequirements memReqs{};
-	vkGetImageMemoryRequirements(device, shadingRateImage.image, &memReqs);
-	
-	VkDeviceSize bufferSize = imageExtent.width * imageExtent.height * sizeof(uint8_t);
-
-	VkMemoryAllocateInfo memAllloc{};
-	memAllloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-	memAllloc.allocationSize = memReqs.size;
-	memAllloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-	VK_CHECK_RESULT(vkAllocateMemory(device, &memAllloc, nullptr, &shadingRateImage.deviceMemory));
-	VK_CHECK_RESULT(vkBindImageMemory(device, shadingRateImage.image, shadingRateImage.deviceMemory, 0));
-
-	VkImageViewCreateInfo imageViewCI{};
-	imageViewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	imageViewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-	imageViewCI.image = shadingRateImage.image;
-	imageViewCI.format = VK_FORMAT_R8_UINT;
-	imageViewCI.subresourceRange.baseMipLevel = 0;
-	imageViewCI.subresourceRange.levelCount = 1;
-	imageViewCI.subresourceRange.baseArrayLayer = 0;
-	imageViewCI.subresourceRange.layerCount = 1;
-	imageViewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	VK_CHECK_RESULT(vkCreateImageView(device, &imageViewCI, nullptr, &shadingRateImage.view));
-
-	shadingRateImage.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-	shadingRateImage.descriptor.imageView = shadingRateImage.view;
-	shadingRateImage.descriptor.sampler = shadingRateImage.sampler = VK_NULL_HANDLE;
-	shadingRateImage.device = vulkanDevice;
-
-	// Populate with lowest possible shading rate pattern
-	uint8_t val = VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_4X4_PIXELS_NV;
-	uint8_t* shadingRatePatternData = new uint8_t[bufferSize];
-	memset(shadingRatePatternData, val, bufferSize);
-
-	// Create a circular pattern with decreasing sampling rates outwards (max. range, pattern)
-	std::map<float, VkShadingRatePaletteEntryNV> patternLookup = {
-		{ 8.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_PIXEL_NV },
-		{ 12.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_2X1_PIXELS_NV },
-		{ 16.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_1X2_PIXELS_NV },
-		{ 18.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_2X2_PIXELS_NV },
-		{ 20.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_4X2_PIXELS_NV },
-		{ 24.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_2X4_PIXELS_NV }
-	};
-
-	uint8_t* ptrData = shadingRatePatternData;
-	for (uint32_t y = 0; y < imageExtent.height; y++) {
-		for (uint32_t x = 0; x < imageExtent.width; x++) {
-			const float deltaX = (float)imageExtent.width / 2.0f - (float)x;
-			const float deltaY = ((float)imageExtent.height / 2.0f - (float)y) * ((float)width / (float)height);
-			const float dist = std::sqrt(deltaX * deltaX + deltaY * deltaY);
-			for (auto pattern : patternLookup) {
-				if (dist < pattern.first) {
-					*ptrData = pattern.second;
-					break;
-				}
-			}
-			ptrData++;
+		// If compute and graphics queue family indices differ, we create an image that can be shared between them
+		// This can result in worse performance than exclusive sharing mode, but save some synchronization to keep the sample simple
+		std::vector<uint32_t> queueFamilyIndices;
+		if (vulkanDevice->queueFamilyIndices.graphics != vulkanDevice->queueFamilyIndices.compute) {
+			queueFamilyIndices = {
+				vulkanDevice->queueFamilyIndices.graphics,
+				vulkanDevice->queueFamilyIndices.compute
+			};
+			imageCI.sharingMode = VK_SHARING_MODE_CONCURRENT;
+			imageCI.queueFamilyIndexCount = 2;
+			imageCI.pQueueFamilyIndices = queueFamilyIndices.data();
 		}
+
+		VK_CHECK_RESULT(vkCreateImage(device, &imageCI, nullptr, &shadingRateImage.image));
+		VkMemoryRequirements memReqs{};
+		vkGetImageMemoryRequirements(device, shadingRateImage.image, &memReqs);
+
+		VkDeviceSize bufferSize = imageExtent.width * imageExtent.height * sizeof(uint8_t);
+
+		VkMemoryAllocateInfo memAllloc{};
+		memAllloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		memAllloc.allocationSize = memReqs.size;
+		memAllloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		VK_CHECK_RESULT(vkAllocateMemory(device, &memAllloc, nullptr, &shadingRateImage.deviceMemory));
+		VK_CHECK_RESULT(vkBindImageMemory(device, shadingRateImage.image, shadingRateImage.deviceMemory, 0));
+
+		VkImageViewCreateInfo imageViewCI{};
+		imageViewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		imageViewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		imageViewCI.image = shadingRateImage.image;
+		imageViewCI.format = VK_FORMAT_R8_UINT;
+		imageViewCI.subresourceRange.baseMipLevel = 0;
+		imageViewCI.subresourceRange.levelCount = 1;
+		imageViewCI.subresourceRange.baseArrayLayer = 0;
+		imageViewCI.subresourceRange.layerCount = 1;
+		imageViewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		VK_CHECK_RESULT(vkCreateImageView(device, &imageViewCI, nullptr, &shadingRateImage.view));
+
+		shadingRateImage.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+		shadingRateImage.descriptor.imageView = shadingRateImage.view;
+		shadingRateImage.descriptor.sampler = shadingRateImage.sampler = VK_NULL_HANDLE;
+		shadingRateImage.device = vulkanDevice;
+
+		// Populate with lowest possible shading rate pattern
+		uint8_t val = VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_4X4_PIXELS_NV;
+		uint8_t* shadingRatePatternData = new uint8_t[bufferSize];
+		memset(shadingRatePatternData, val, bufferSize);
+
+		// Create a circular pattern with decreasing sampling rates outwards (max. range, pattern)
+		std::map<float, VkShadingRatePaletteEntryNV> patternLookup = {
+			{ 8.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_PIXEL_NV },
+			{ 12.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_2X1_PIXELS_NV },
+			{ 16.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_1X2_PIXELS_NV },
+			{ 18.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_2X2_PIXELS_NV },
+			{ 20.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_4X2_PIXELS_NV },
+			{ 24.0f, VK_SHADING_RATE_PALETTE_ENTRY_1_INVOCATION_PER_2X4_PIXELS_NV }
+		};
+
+		uint8_t* ptrData = shadingRatePatternData;
+		for (uint32_t y = 0; y < imageExtent.height; y++) {
+			for (uint32_t x = 0; x < imageExtent.width; x++) {
+				const float deltaX = (float)imageExtent.width / 2.0f - (float)x;
+				const float deltaY = ((float)imageExtent.height / 2.0f - (float)y) * ((float)width / (float)height);
+				const float dist = std::sqrt(deltaX * deltaX + deltaY * deltaY);
+				for (auto pattern : patternLookup) {
+					if (dist < pattern.first) {
+						*ptrData = pattern.second;
+						break;
+					}
+				}
+				ptrData++;
+			}
+		}
+
+		VkBuffer stagingBuffer;
+		VkDeviceMemory stagingMemory;
+
+		VkBufferCreateInfo bufferCreateInfo{};
+		bufferCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferCreateInfo.size = bufferSize;
+		bufferCreateInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+		bufferCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		VK_CHECK_RESULT(vkCreateBuffer(device, &bufferCreateInfo, nullptr, &stagingBuffer));
+		VkMemoryAllocateInfo memAllocInfo{};
+		memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		memReqs = {};
+		vkGetBufferMemoryRequirements(device, stagingBuffer, &memReqs);
+		memAllocInfo.allocationSize = memReqs.size;
+		memAllocInfo.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+		VK_CHECK_RESULT(vkAllocateMemory(device, &memAllocInfo, nullptr, &stagingMemory));
+		VK_CHECK_RESULT(vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0));
+
+		uint8_t* mapped;
+		VK_CHECK_RESULT(vkMapMemory(device, stagingMemory, 0, memReqs.size, 0, (void**)&mapped));
+		memcpy(mapped, shadingRatePatternData, bufferSize);
+		vkUnmapMemory(device, stagingMemory);
+
+		delete[] shadingRatePatternData;
+
+		// Upload
+		VkCommandBuffer copyCmd = vulkanDevice->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
+		VkImageSubresourceRange subresourceRange = {};
+		subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		subresourceRange.levelCount = 1;
+		subresourceRange.layerCount = 1;
+		{
+			VkImageMemoryBarrier imageMemoryBarrier{};
+			imageMemoryBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			imageMemoryBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			imageMemoryBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			imageMemoryBarrier.srcAccessMask = 0;
+			imageMemoryBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			imageMemoryBarrier.image = shadingRateImage.image;
+			imageMemoryBarrier.subresourceRange = subresourceRange;
+			// to solve VUID-VkImageMemoryBarrier-synchronization2-03857
+			imageMemoryBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			imageMemoryBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vkCmdPipelineBarrier(copyCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
+		}
+		VkBufferImageCopy bufferCopyRegion{};
+		bufferCopyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		bufferCopyRegion.imageSubresource.layerCount = 1;
+		bufferCopyRegion.imageExtent.width = imageExtent.width;
+		bufferCopyRegion.imageExtent.height = imageExtent.height;
+		bufferCopyRegion.imageExtent.depth = 1;
+		vkCmdCopyBufferToImage(copyCmd, stagingBuffer, shadingRateImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bufferCopyRegion);
+		{
+			VkImageMemoryBarrier imageMemoryBarrier{};
+			imageMemoryBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			imageMemoryBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			imageMemoryBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			imageMemoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			imageMemoryBarrier.dstAccessMask = 0;
+			imageMemoryBarrier.image = shadingRateImage.image;
+			imageMemoryBarrier.subresourceRange = subresourceRange;
+			imageMemoryBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			imageMemoryBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vkCmdPipelineBarrier(copyCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
+		}
+		vulkanDevice->flushCommandBuffer(copyCmd, queue, true);
+
+		vkFreeMemory(device, stagingMemory, nullptr);
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
 	}
-
-	VkBuffer stagingBuffer;
-	VkDeviceMemory stagingMemory;
-
-	VkBufferCreateInfo bufferCreateInfo{};
-	bufferCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-	bufferCreateInfo.size = bufferSize;
-	bufferCreateInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-	bufferCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	VK_CHECK_RESULT(vkCreateBuffer(device, &bufferCreateInfo, nullptr, &stagingBuffer));
-	VkMemoryAllocateInfo memAllocInfo{};
-	memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-	memReqs = {};
-	vkGetBufferMemoryRequirements(device, stagingBuffer, &memReqs);
-	memAllocInfo.allocationSize = memReqs.size;
-	memAllocInfo.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-	VK_CHECK_RESULT(vkAllocateMemory(device, &memAllocInfo, nullptr, &stagingMemory));
-	VK_CHECK_RESULT(vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0));
-
-	uint8_t* mapped;
-	VK_CHECK_RESULT(vkMapMemory(device, stagingMemory, 0, memReqs.size, 0, (void**)&mapped));
-	memcpy(mapped, shadingRatePatternData, bufferSize);
-	vkUnmapMemory(device, stagingMemory);
-
-	delete[] shadingRatePatternData;
-
-	// Upload
-	VkCommandBuffer copyCmd = vulkanDevice->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
-	VkImageSubresourceRange subresourceRange = {};
-	subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	subresourceRange.levelCount = 1;
-	subresourceRange.layerCount = 1;
+	// error history image
 	{
-		VkImageMemoryBarrier imageMemoryBarrier{};
-		imageMemoryBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		imageMemoryBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-		imageMemoryBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-		imageMemoryBarrier.srcAccessMask = 0;
-		imageMemoryBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		imageMemoryBarrier.image = shadingRateImage.image;
-		imageMemoryBarrier.subresourceRange = subresourceRange;
-		// to solve VUID-VkImageMemoryBarrier-synchronization2-03857
-		imageMemoryBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		imageMemoryBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		vkCmdPipelineBarrier(copyCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
-	}
-	VkBufferImageCopy bufferCopyRegion{};
-	bufferCopyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	bufferCopyRegion.imageSubresource.layerCount = 1;
-	bufferCopyRegion.imageExtent.width = imageExtent.width;
-	bufferCopyRegion.imageExtent.height = imageExtent.height;
-	bufferCopyRegion.imageExtent.depth = 1;
-	vkCmdCopyBufferToImage(copyCmd, stagingBuffer, shadingRateImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bufferCopyRegion);
-	{
-		VkImageMemoryBarrier imageMemoryBarrier{};
-		imageMemoryBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		imageMemoryBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-		imageMemoryBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-		imageMemoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		imageMemoryBarrier.dstAccessMask = 0;
-		imageMemoryBarrier.image = shadingRateImage.image;
-		imageMemoryBarrier.subresourceRange = subresourceRange;
-		imageMemoryBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		imageMemoryBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		vkCmdPipelineBarrier(copyCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
-	}
-	vulkanDevice->flushCommandBuffer(copyCmd, queue, true);
+		auto const format = VK_FORMAT_R32G32_SFLOAT;
 
-	vkFreeMemory(device, stagingMemory, nullptr);
-	vkDestroyBuffer(device, stagingBuffer, nullptr);
+		VkImageCreateInfo imageCI{};
+		imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageCI.imageType = VK_IMAGE_TYPE_2D;
+		imageCI.format = format;
+		imageCI.extent = imageExtent;
+		imageCI.mipLevels = 1;
+		imageCI.arrayLayers = 1;
+		imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageCI.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+
+		VK_CHECK_RESULT(vkCreateImage(device, &imageCI, nullptr, &compute.errorHistoryImage.image));
+		VkMemoryRequirements memReqs{};
+		vkGetImageMemoryRequirements(device, compute.errorHistoryImage.image, &memReqs);
+
+		VkMemoryAllocateInfo memAllloc{};
+		memAllloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		memAllloc.allocationSize = memReqs.size;
+		memAllloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		VK_CHECK_RESULT(vkAllocateMemory(device, &memAllloc, nullptr, &compute.errorHistoryImage.deviceMemory));
+		VK_CHECK_RESULT(vkBindImageMemory(device, compute.errorHistoryImage.image, compute.errorHistoryImage.deviceMemory, 0));
+
+		VkImageViewCreateInfo imageViewCI{};
+		imageViewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		imageViewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		imageViewCI.image = compute.errorHistoryImage.image;
+		imageViewCI.format = format;
+		imageViewCI.subresourceRange.baseMipLevel = 0;
+		imageViewCI.subresourceRange.levelCount = 1;
+		imageViewCI.subresourceRange.baseArrayLayer = 0;
+		imageViewCI.subresourceRange.layerCount = 1;
+		imageViewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		VK_CHECK_RESULT(vkCreateImageView(device, &imageViewCI, nullptr, &compute.errorHistoryImage.view));
+
+		compute.errorHistoryImage.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+		compute.errorHistoryImage.descriptor.imageView = compute.errorHistoryImage.view;
+		compute.errorHistoryImage.descriptor.sampler = compute.errorHistoryImage.sampler = VK_NULL_HANDLE;
+		compute.errorHistoryImage.device = vulkanDevice;
+
+		VkCommandBuffer commandBuffer = vulkanDevice->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
+		VkImageSubresourceRange subresourceRange = {};
+		subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		subresourceRange.levelCount = 1;
+		subresourceRange.layerCount = 1;
+		{
+			VkImageMemoryBarrier imageMemoryBarrier{};
+			imageMemoryBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			imageMemoryBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			imageMemoryBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			imageMemoryBarrier.image = compute.errorHistoryImage.image;
+			imageMemoryBarrier.subresourceRange = subresourceRange;
+			imageMemoryBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			imageMemoryBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
+		}
+		vulkanDevice->flushCommandBuffer(commandBuffer, queue, true);
+	}
 }
 
 void VulkanExample::preparePipelines()
@@ -476,19 +544,35 @@ void VulkanExample::prepareUniformBuffers()
 	VK_CHECK_RESULT(vulkanDevice->createBuffer(
 		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-		&shaderData.buffer,
-		sizeof(shaderData.values)));
-	VK_CHECK_RESULT(shaderData.buffer.map());
+		&sceneUBO.buffer,
+		sizeof(sceneUBO.values)));
+	VK_CHECK_RESULT(sceneUBO.buffer.map());
+
+	VK_CHECK_RESULT(vulkanDevice->createBuffer(
+		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&computeUBO.buffer,
+		sizeof(computeUBO.values)));
+	VK_CHECK_RESULT(computeUBO.buffer.map());
+
 	updateUniformBuffers();
 }
 
 void VulkanExample::updateUniformBuffers()
 {
-	shaderData.values.projection = camera.matrices.perspective;
-	shaderData.values.view = camera.matrices.view;
-	shaderData.values.viewPos = camera.viewPos;
-	shaderData.values.colorShadingRate = colorShadingRate;
-	memcpy(shaderData.buffer.mapped, &shaderData.values, sizeof(shaderData.values));
+	sceneUBO.values.projection = camera.matrices.perspective;
+	sceneUBO.values.view = camera.matrices.view;
+	sceneUBO.values.viewPos = camera.viewPos;
+	sceneUBO.values.colorShadingRate = colorShadingRate;
+	memcpy(sceneUBO.buffer.mapped, &sceneUBO.values, sizeof(sceneUBO.values));
+
+	auto projView = camera.matrices.perspective * camera.matrices.view;
+	computeUBO.values.reprojection = previousProjView * glm::inverse(projView);
+	computeUBO.values.mode = mode;
+	computeUBO.values.sensitivity = sensitivity;
+	memcpy(computeUBO.buffer.mapped, &computeUBO.values, sizeof(computeUBO.values));
+
+	previousProjView = projView;
 }
 
 void VulkanExample::prepareGraphics()
@@ -516,6 +600,9 @@ void VulkanExample::prepareCompute()
 		vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 0),
 		// output image (shading rate texture)
 		vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 1),
+		vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 2),
+		vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 3),
+		vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 4),
 	};
 
 	VkDescriptorSetLayoutCreateInfo descriptorLayout = vks::initializers::descriptorSetLayoutCreateInfo(setLayoutBindings);
@@ -527,13 +614,18 @@ void VulkanExample::prepareCompute()
 	VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &compute.descriptorSetLayout, 1);
 	VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &compute.descriptorSet));
 
-	VkDescriptorImageInfo inputImageInfo = main.frameBuffer.colorImage.descriptor;
-	// set image layout to general for compute shader storage image
-	inputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+	std::array<VkDescriptorImageInfo, 2> inputImageInfo{};
+	inputImageInfo[0] = main.frameBuffer.colorImage.descriptor;
+	inputImageInfo[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+	inputImageInfo[1] = main.frameBuffer.shadingRateVisualizeImage.descriptor;
+	inputImageInfo[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
 	std::vector<VkWriteDescriptorSet> computeWriteDescriptorSets = {
-		vks::initializers::writeDescriptorSet(compute.descriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, &inputImageInfo),
-		vks::initializers::writeDescriptorSet(compute.descriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, &shadingRateImage.descriptor),
+		vks::initializers::writeDescriptorSet(compute.descriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, &inputImageInfo[0]),
+		vks::initializers::writeDescriptorSet(compute.descriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, &inputImageInfo[1]),
+		vks::initializers::writeDescriptorSet(compute.descriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2, &shadingRateImage.descriptor),
+		vks::initializers::writeDescriptorSet(compute.descriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3, &compute.errorHistoryImage.descriptor),
+		vks::initializers::writeDescriptorSet(compute.descriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4, &computeUBO.buffer.descriptor),
 	};
 	vkUpdateDescriptorSets(device, static_cast<uint32_t>(computeWriteDescriptorSets.size()), computeWriteDescriptorSets.data(), 0, nullptr);
 
@@ -588,6 +680,9 @@ void VulkanExample::buildComputeCommandBuffer()
 		vkCmdPipelineBarrier(compute.commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
 		imageMemoryBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 		imageMemoryBarrier.image = main.frameBuffer.colorImage.image;
+		vkCmdPipelineBarrier(compute.commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
+		imageMemoryBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		imageMemoryBarrier.image = main.frameBuffer.shadingRateVisualizeImage.image;
 		vkCmdPipelineBarrier(compute.commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
 	}
 
@@ -713,16 +808,18 @@ void VulkanExample::prepareMainRenderPass()
 	}
 	// framebuffer shading rate visualize image
 	{
+		auto const format = VK_FORMAT_R32G32B32A32_SFLOAT;
+
 		VkImageCreateInfo imageCI{};
 		imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 		imageCI.imageType = VK_IMAGE_TYPE_2D;
-		imageCI.format = swapChain.colorFormat;
+		imageCI.format = format;
 		imageCI.extent = VkExtent3D{ width, height, 1 };
 		imageCI.mipLevels = 1;
 		imageCI.arrayLayers = 1;
 		imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
 		imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
-		imageCI.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+		imageCI.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
 
 		VK_CHECK_RESULT(vkCreateImage(device, &imageCI, nullptr, &main.frameBuffer.shadingRateVisualizeImage.image));
 		VkMemoryRequirements memReqs{};
@@ -739,7 +836,7 @@ void VulkanExample::prepareMainRenderPass()
 		imageViewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
 		imageViewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
 		imageViewCI.image = main.frameBuffer.shadingRateVisualizeImage.image;
-		imageViewCI.format = swapChain.colorFormat;
+		imageViewCI.format = format;
 		imageViewCI.subresourceRange.baseMipLevel = 0;
 		imageViewCI.subresourceRange.levelCount = 1;
 		imageViewCI.subresourceRange.baseArrayLayer = 0;
@@ -766,6 +863,24 @@ void VulkanExample::prepareMainRenderPass()
 		main.frameBuffer.shadingRateVisualizeImage.descriptor.imageView = main.frameBuffer.shadingRateVisualizeImage.view;
 		main.frameBuffer.shadingRateVisualizeImage.descriptor.sampler = main.frameBuffer.shadingRateVisualizeImage.sampler;
 		main.frameBuffer.shadingRateVisualizeImage.device = vulkanDevice;
+
+		VkCommandBuffer commandBuffer = vulkanDevice->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
+		VkImageSubresourceRange subresourceRange = {};
+		subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		subresourceRange.levelCount = 1;
+		subresourceRange.layerCount = 1;
+		{
+			VkImageMemoryBarrier imageMemoryBarrier{};
+			imageMemoryBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			imageMemoryBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			imageMemoryBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			imageMemoryBarrier.image = main.frameBuffer.shadingRateVisualizeImage.image;
+			imageMemoryBarrier.subresourceRange = subresourceRange;
+			imageMemoryBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			imageMemoryBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
+		}
+		vulkanDevice->flushCommandBuffer(commandBuffer, queue, true);
 	}
 	// renderPass
 	{
@@ -789,7 +904,7 @@ void VulkanExample::prepareMainRenderPass()
 		attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 		// shading rate visualize attachment
-		attachments[2].format = swapChain.colorFormat;
+		attachments[2].format = VK_FORMAT_R32G32B32A32_SFLOAT;
 		attachments[2].samples = VK_SAMPLE_COUNT_1_BIT;
 		attachments[2].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 		attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1001,6 +1116,15 @@ void VulkanExample::OnUpdateUIOverlay(vks::UIOverlay* overlay)
 		buildCommandBuffers();
 	}
 	if (overlay->checkBox("Color shading rates", &colorShadingRate)) {
+		updateUniformBuffers();
+	}
+	overlay->sliderFloat("Adaptive sensitivity", &sensitivity, 0.0f, 1.0f);
+	if (overlay->radioButton("Content adaptive mode", mode == 0)) {
+		mode = 0;
+		updateUniformBuffers();
+	}
+	if (overlay->radioButton("Motion adaptive mode", mode == 1)) {
+		mode = 1;
 		updateUniformBuffers();
 	}
 }

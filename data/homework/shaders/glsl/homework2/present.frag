@@ -10,5 +10,29 @@ layout (set = 0, binding = 1) uniform sampler2D u_shadingRateVisualize;
 void main() {
 	vec3 color = texture(u_image, in_uv).rgb;
 	vec3 visualize = texture(u_shadingRateVisualize, in_uv).rgb;
-	out_fragColor = vec4(color * visualize, 1.0);
+	vec3 visualizeColor = vec3(1.0);
+
+	if (int(visualize.r) == 1 && int(visualize.g) == 1) {
+		visualizeColor = vec3(0.2, 0.4, 0.2);
+	}
+	if (int(visualize.r) == 2 && int(visualize.g) == 1) {
+		visualizeColor = vec3(0.6, 0.2, 0.0);
+	}
+	if (int(visualize.r) == 1 && int(visualize.g) == 2) {
+		visualizeColor = vec3(0.0, 0.2, 0.6);
+	}
+	if (int(visualize.r) == 2 && int(visualize.g) == 2) {
+		visualizeColor = vec3(0.4, 0.6, 0.4);
+	}
+	if (int(visualize.r) == 4 && int(visualize.g) == 2) {
+		visualizeColor = vec3(1.0, 0.4, 0.0);
+	}
+	if (int(visualize.r) == 2 && int(visualize.g) == 4) {
+		visualizeColor = vec3(0.0, 0.4, 1.0);
+	}
+	if (int(visualize.r) == 4 && int(visualize.g) == 4) {
+		visualizeColor = vec3(0.6, 1.0, 0.6);
+	}
+
+	out_fragColor = vec4(color * visualizeColor, 1.0);
 }
