@@ -6,12 +6,13 @@ layout (local_size_x = 16, local_size_y = 16) in;
 layout (set = 0, binding = 0, rgba8) uniform readonly image2D u_color;
 layout (set = 0, binding = 1, rgba32f) uniform readonly image2D u_depth;
 layout (set = 0, binding = 2, r8ui) uniform uimage2D u_output;
-layout (set = 0, binding = 3, rg32f) uniform image2D u_error;
+layout (set = 0, binding = 3, rgba32f) uniform image2D u_error;
 
 layout (set = 0, binding = 4) uniform UBOCompute 
 {
 	mat4 reprojection;
 	int mode;
+	int duelThreshold;
 	float sensitivity;
 } uboCompute;
 
@@ -28,7 +29,7 @@ float luminance(vec3 color) {
 }
 
 const float k = 2.13;
-const float eps = 0.0001;
+const float eps = 0.001;
 
 shared float sX;
 shared float sY;
@@ -105,16 +106,18 @@ void main() {
 		const float I_avg = sI * invTexelSize;
 		const float t = uboCompute.sensitivity;
 		const float l = 0.0;
-		const float tau = t * (I_avg + l);
+		float tau = t * (I_avg + l);
 
-		float history_E_HX = imageLoad(u_error, p).x;
-		float history_E_HY = imageLoad(u_error, p).y;
+		const vec3 history = imageLoad(u_error, p).xyz;
+		const float history_E_HX = history.x;
+		const float history_E_HY = history.y;
+		const float history_tau = history.z;
 
-		history_E_HX = mix(E_HX, history_E_HX, 0.975);
-		history_E_HY = mix(E_HY, history_E_HY, 0.975);
-
-		E_HX = clamp(E_HX, history_E_HX * (1.0 - eps), history_E_HX * (1.0 + eps));
-		E_HY = clamp(E_HY, history_E_HY * (1.0 - eps), history_E_HY * (1.0 + eps));
+		// duel threshold for supressing shading rate oscillating in successive frames
+		if (uboCompute.duelThreshold == 1) {
+			E_HX = clamp(E_HX, history_E_HX * (1.0 - eps), history_E_HX * (1.0 + eps));
+			E_HY = clamp(E_HY, history_E_HY * (1.0 - eps), history_E_HY * (1.0 + eps));
+		}
 
 		// motion adaptive shading
 		const float E_HX_v = b_HX * invTexelSize * E_HX;
@@ -122,7 +125,6 @@ void main() {
 		const float E_QX_v = b_QX * invTexelSize * E_HX;
 		const float E_QY_v = b_QY * invTexelSize * E_HY;
 
-		uint shadingRate = PALETTE_1_INVOCATION_PER_4X4_PIXELS;
 		uint rX = 2;
 		uint rY = 2;
 		if (uboCompute.mode == 0) {
@@ -156,6 +158,7 @@ void main() {
 			}
 		}
 
+		uint shadingRate = PALETTE_1_INVOCATION_PER_4X4_PIXELS;
 		if (rX == 1 && rY == 1) {
 			shadingRate = PALETTE_1_INVOCATION_PER_PIXEL;
 		}
@@ -177,6 +180,6 @@ void main() {
 
 		uvec4 ret = uvec4(shadingRate, 0, 0, 0);
 		imageStore(u_output, p, ret);
-		imageStore(u_error, p, vec4(E_HX, E_HY, 0.0, 0.0));
+		imageStore(u_error, p, vec4(E_HX, E_HY, tau, 0.0));
 	}
 }

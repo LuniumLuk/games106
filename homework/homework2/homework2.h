@@ -35,6 +35,7 @@ public:
 
 	glm::mat4 previousProjView = glm::mat4(1.0f);
 	int mode = 0;
+	bool duelThreshold = false; // first frame cannot have duel threshold
 	float sensitivity = 0.1f;
 
 	struct ComputeUBO {
@@ -42,6 +43,7 @@ public:
 		struct Values {
 			glm::mat4 reprojection;
 			int mode;
+			int duelThreshold;
 			float sensitivity;
 		} values;
 	} computeUBO;

@@ -394,7 +394,7 @@ void VulkanExample::prepareShadingRateImage()
 	}
 	// error history image
 	{
-		auto const format = VK_FORMAT_R32G32_SFLOAT;
+		auto const format = VK_FORMAT_R32G32B32A32_SFLOAT;
 
 		VkImageCreateInfo imageCI{};
 		imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -570,6 +570,7 @@ void VulkanExample::updateUniformBuffers()
 	computeUBO.values.reprojection = previousProjView * glm::inverse(projView);
 	computeUBO.values.mode = mode;
 	computeUBO.values.sensitivity = sensitivity;
+	computeUBO.values.duelThreshold = static_cast<int>(duelThreshold);
 	memcpy(computeUBO.buffer.mapped, &computeUBO.values, sizeof(computeUBO.values));
 
 	previousProjView = projView;
@@ -1118,7 +1119,31 @@ void VulkanExample::OnUpdateUIOverlay(vks::UIOverlay* overlay)
 	if (overlay->checkBox("Color shading rates", &colorShadingRate)) {
 		updateUniformBuffers();
 	}
+	if (colorShadingRate) {
+		overlay->text("-- COLOR SCHEME -------------------------------------------");
+		overlay->text("Just for display");
+		std::unordered_map<std::string, glm::vec4> shadingRateColor = {
+			{ "1x1", { 0.2f, 0.4f, 0.2f, 1.0f } },
+			{ "2x1", { 0.6f, 0.2f, 0.0f, 1.0f } },
+			{ "1x2", { 0.0f, 0.2f, 0.6f, 1.0f } },
+			{ "2x2", { 0.4f, 0.6f, 0.4f, 1.0f } },
+			{ "4x2", { 1.0f, 0.4f, 0.0f, 1.0f } },
+			{ "2x4", { 0.0f, 0.4f, 1.0f, 1.0f } },
+			{ "4x4", { 0.6f, 1.0f, 0.6f, 1.0f } },
+		};
+
+		for (auto& color : shadingRateColor) {
+			overlay->colorPicker(color.first.c_str(), &color.second[0]);
+		}
+	}
+	overlay->text("-- SENSITIVITY --------------------------------------------");
 	overlay->sliderFloat("Adaptive sensitivity", &sensitivity, 0.0f, 1.0f);
+	overlay->text("-- DULE THRESHOLD -----------------------------------------");
+	overlay->text("Duel threshold for suppressing oscillating");
+	if (overlay->checkBox("Enable duel threshold", &duelThreshold)) {
+		updateUniformBuffers();
+	}
+	overlay->text("-- ADAPTIVE MODE ------------------------------------------");
 	if (overlay->radioButton("Content adaptive mode", mode == 0)) {
 		mode = 0;
 		updateUniformBuffers();
@@ -1127,6 +1152,12 @@ void VulkanExample::OnUpdateUIOverlay(vks::UIOverlay* overlay)
 		mode = 1;
 		updateUniformBuffers();
 	}
+	if (mode == 1) {
+		overlay->text("when \"Color shading rates\" is on, you can see that");
+		overlay->text("draging the scene vertically, it appears more blue-ish");
+		overlay->text("draging the scene horizontally, it appears more red-ish");
+	}
+
 }
 
 VULKAN_EXAMPLE_MAIN()
